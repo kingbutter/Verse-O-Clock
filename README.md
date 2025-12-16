@@ -1,4 +1,8 @@
-# Verse O'Clock
+# XIAO ESP32‑C3 + 7.5" e‑Paper Bible Clock
+
+[![Build](https://github.com/kingbutter/Verse-O-Clock/actions/workflows/build-release.yml/badge.svg)](https://github.com/kingbutter/Verse-O-Clock/actions/workflows/build-release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/kingbutter/Verse-O-Clock?label=release)](https://github.com/kingbutter/Verse-O-Clock/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A beautiful, ultra‑low‑power Bible verse display that shows **real KJV verses** matching the current time (e.g., John 3:16 at 03:16). Features captive Wi‑Fi/timezone setup, NTP auto‑sync, deep sleep for months on battery, and full offline Bible storage. Perfect for makers, devs, and faith‑inspired IoT projects.
 
@@ -51,6 +55,16 @@ This project was developed and tested using the **Seeed Studio XIAO 7.5" ePaper 
 | DIN     | 6         |
 
 > If using a Seeed e‑Paper shield or the integrated Seeed panel above, no wiring is required.
+
+---
+
+## Supported Devices
+
+| Device                                                                                        | MCU      | Display           | Resolution | Status      | Notes                                                          |
+| --------------------------------------------------------------------------------------------- | -------- | ----------------- | ---------- | ----------- | -------------------------------------------------------------- |
+| [Seeed XIAO 7.5″ ePaper Panel](https://www.seeedstudio.com/XIAO-7-5-ePaper-Panel-p-6416.html) | ESP32-C3 | 7.5″ ePaper (B&W) | 800×480    | ✅ Supported | All-in-one panel; no wiring required; primary reference device |
+
+> 💡 **Want to add your device?** Check out the [Contributing](#contributing) section below — new devices are very welcome.
 
 ---
 
