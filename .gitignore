@@ -1,0 +1,18 @@
+# =========================
+# Generated verse data
+# =========================
+
+# Ignore binary verse data in any device data folder
+devices/**/data/**/*.bin
+
+# Ignore summary files generated next to data/
+summary.*
+*.summary
+*summary*
+
+# Optional
+*.tmp
+*.log
+
+# Keep directories
+!devices/**/data/

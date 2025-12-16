@@ -1,0 +1,290 @@
+name: Build & Release (devices)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------
+  # Generate a device build matrix from devices.json
+  # ------------------------------------------------------------
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.mk.outputs.include }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build matrix from devices.json
+        id: mk
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          cfg = json.loads(Path("devices.json").read_text(encoding="utf-8"))
+          include = []
+
+          for d in cfg.get("devices", []):
+            device_id = d["id"]
+            sketch = f"devices/{device_id}"
+
+            fqbn = d["board"]
+            ps = d.get("partition_scheme")
+            if ps:
+              fqbn = f"{fqbn}:PartitionScheme={ps}"
+
+            busy_patch = bool(d.get("display", {}).get("busy_polarity_patch", False))
+
+            include.append({
+              "id": device_id,
+              "sketch": sketch,
+              "fqbn": fqbn,
+              "busy_patch": busy_patch,
+            })
+
+          out = {"device": include}
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write("include=" + json.dumps(out) + "\n")
+
+          print(json.dumps(out, indent=2))
+          PY
+
+  build:
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.include) }}
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout + toolchains
+      # ------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      # ------------------------------------------------------------
+      # Libraries
+      # ------------------------------------------------------------
+      - name: Install Arduino libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Needed for --git-url installs with arduino-cli >= 1.4
+          arduino-cli config set library.enable_unsafe_install true
+          arduino-cli lib update-index
+
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "GxEPD2"
+          arduino-cli lib install "Adafruit GFX Library"
+          # Force Unishox from upstream GitHub repo
+          arduino-cli lib install --git-url https://github.com/siara-cc/Unishox_Arduino_lib.git
+
+      - name: Patch GxEPD2 BUSY polarity (device flag)
+        if: ${{ matrix.device.busy_patch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Patching GxEPD2 BUSY polarity for ${{ matrix.device.id }} (targeted to GxEPD2_750_T7)."
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          lib_root = Path.home() / "Arduino" / "libraries" / "GxEPD2"
+          if not lib_root.exists():
+            raise SystemExit(f"GxEPD2 not found at {lib_root}")
+
+          # Find the one header that defines the driver class, and patch only that file.
+          candidates = []
+          for f in (lib_root / "src").rglob("*.h"):
+            try:
+              t = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+              continue
+            if "class GxEPD2_750_T7" in t:
+              candidates.append(f)
+
+          if len(candidates) != 1:
+            raise SystemExit("Expected exactly 1 driver file containing 'class GxEPD2_750_T7', found "
+                             f"{len(candidates)}: " + ", ".join(str(p) for p in candidates))
+
+          target = candidates[0]
+          text = target.read_text(encoding="utf-8", errors="ignore")
+
+          new = re.sub(r"(\bbusy_level\s*=\s*)LOW\b", r"\1HIGH", text)
+          new = re.sub(r"(\b_busy_level\s*=\s*)LOW\b", r"\1HIGH", new)
+
+          if new == text:
+            print(f"No changes needed in {target} (already patched or pattern not present).")
+          else:
+            target.write_text(new, encoding="utf-8")
+            print(f"Patched BUSY polarity in: {target}")
+          PY
+
+      # ------------------------------------------------------------
+      # Build verse data (Python → device data/)
+      # ------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build verse assets into device data/ (${{ matrix.device.id }})
+        shell: bash
+        working-directory: ${{ matrix.device.sketch }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install unishox2-py3
+          # helpers/ lives at repo root
+          python ../../helpers/build_verses_unishox.py
+
+      # ------------------------------------------------------------
+      # Compile firmware
+      # ------------------------------------------------------------
+      - name: Compile firmware (${{ matrix.device.id }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli compile             --fqbn "${{ matrix.device.fqbn }}"             --export-binaries             --build-path "${{ matrix.device.sketch }}/build"             "${{ matrix.device.sketch }}"
+
+      # ------------------------------------------------------------
+      # Build LittleFS image from data/ (IDE-like partitions.csv resolution)
+      # ------------------------------------------------------------
+      - name: Build LittleFS image (${{ matrix.device.id }})
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SKETCH_DIR="${{ matrix.device.sketch }}"
+          FQBN="${{ matrix.device.fqbn }}"
+          DATA_DIR="$SKETCH_DIR/data"
+
+          # Resolve partitions.csv the same way Arduino IDE / ESP32 core does:
+          # - If sketch folder contains partitions.csv, that overrides the board's built-in scheme.
+          # - Otherwise, derive the built-in partitions CSV from arduino-cli --show-properties.
+          PART_CSV="$SKETCH_DIR/partitions.csv"
+
+          if [[ ! -f "$PART_CSV" ]]; then
+            PROPS="$(arduino-cli compile --fqbn "$FQBN" --show-properties --build-path "$SKETCH_DIR/build" "$SKETCH_DIR")"
+            RUNTIME_PLATFORM_PATH="$(printf "%s\n" "$PROPS" | awk -F= '$1=="runtime.platform.path"{print $2; exit}')"
+            BUILD_PARTITIONS="$(printf "%s\n" "$PROPS" | awk -F= '$1=="build.partitions"{print $2; exit}')"
+
+            if [[ -z "${RUNTIME_PLATFORM_PATH}" || -z "${BUILD_PARTITIONS}" ]]; then
+              echo "ERROR: Could not determine runtime.platform.path/build.partitions from --show-properties"
+              exit 1
+            fi
+
+            PART_CSV="$RUNTIME_PLATFORM_PATH/tools/partitions/${BUILD_PARTITIONS}.csv"
+            if [[ ! -f "$PART_CSV" ]]; then
+              echo "ERROR: Built-in partitions CSV not found: $PART_CSV"
+              exit 1
+            fi
+          fi
+
+          echo "Using partitions CSV: $PART_CSV"
+
+          LFS_OFF_HEX="$(awk -F',' '$1 ~ /^[[:space:]]*littlefs[[:space:]]*$/ {gsub(/[[:space:]]/,"",$4); print $4; exit}' "$PART_CSV")"
+          LFS_SIZE_HEX="$(awk -F',' '$1 ~ /^[[:space:]]*littlefs[[:space:]]*$/ {gsub(/[[:space:]]/,"",$5); print $5; exit}' "$PART_CSV")"
+
+          if [[ -z "$LFS_SIZE_HEX" ]]; then
+            echo "ERROR: littlefs partition not found in: $PART_CSV"
+            exit 1
+          fi
+
+          LFS_SIZE_BYTES=$((LFS_SIZE_HEX))
+
+          # Robustly get Arduino CLI data dir (JSON). Fallback to default location.
+          CORE_DATA="$(arduino-cli config dump --format json 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('directories',{}).get('data',''))" || true)"
+          [[ -n "${CORE_DATA}" ]] || CORE_DATA="$HOME/.arduino15"
+
+          MKL="$(find "$CORE_DATA/packages/esp32/tools" -type f -name mklittlefs -print -quit 2>/dev/null || true)"
+          if [[ -z "${MKL}" ]]; then
+            echo "ERROR: mklittlefs not found under $CORE_DATA/packages/esp32/tools"
+            arduino-cli core list || true
+            exit 1
+          fi
+
+          mkdir -p dist
+          "$MKL" -c "$DATA_DIR" -s "$LFS_SIZE_BYTES" "dist/${{ matrix.device.id }}_littlefs.bin"
+          echo "$LFS_OFF_HEX" > "dist/${{ matrix.device.id }}_littlefs_offset.txt"
+
+      # ------------------------------------------------------------
+      # Collect firmware + devices.json
+      # ------------------------------------------------------------
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pick the main firmware .bin from the build output (skip littlefs if present)
+          BIN_PATH="$(find "${{ matrix.device.sketch }}/build" -type f -name '*.bin' ! -name '*littlefs*' | head -n 1)"
+          test -f "$BIN_PATH"
+
+          mkdir -p dist
+          cp -v "$BIN_PATH" "dist/${{ matrix.device.id }}_firmware.bin"
+
+          if [[ -f "devices.json" ]]; then
+            cp -v devices.json dist/devices.json
+          fi
+
+      # ------------------------------------------------------------
+      # Upload / Release
+      # ------------------------------------------------------------
+      - name: Upload artifacts (manual runs)
+        if: startsWith(github.ref, 'refs/tags/') != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.device.id }}
+          path: dist/*
+
+      - name: Resolve release title/body (from releases/<tag>.md)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="releases/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$NOTES" ]]; then
+            echo "ERROR: Release notes file not found: $NOTES"
+            exit 1
+          fi
+          RAW_TITLE="$(head -n 1 "$NOTES")"
+          TITLE="$(echo "$RAW_TITLE" | sed -E 's/^#+[[:space:]]*//; s/[[:space:]]+$//')"
+          if [[ -z "${TITLE}" ]]; then
+            echo "ERROR: First line of $NOTES is empty (used as release title)"
+            exit 1
+          fi
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "body_path=$NOTES" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release_meta.outputs.title }}
+          body_path: ${{ steps.release_meta.outputs.body_path }}
+          files: dist/*
+          generate_release_notes: false
+          overwrite_files: true

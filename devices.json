@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "devices": [
+    {
+      "id": "xiao_esp32c3_7p5",
+      "name": "XIAO ESP32-C3 + 7.5in ePaper",
+      "board": "esp32:esp32:XIAO_ESP32C3",
+      "partition_scheme": "huge_app",
+      "display": {
+        "type": "epaper",
+        "size_in": 7.5,
+        "resolution": "800x480",
+        "busy_polarity_patch": true
+      },
+      "ota": {
+        "enabled": true,
+        "firmware": "xiao_esp32c3_7p5_firmware.bin"
+      }
+    }
+  ]
+}
