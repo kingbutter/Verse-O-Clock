@@ -71,7 +71,6 @@
 
 #if ENABLE_HTTP_OTA
   #include "verseoclock_version.h"
-  #include "verseoclock_ota.h"
 #endif
 
 #define OTA_FW_ASSET_SUFFIX "_firmware.bin"
