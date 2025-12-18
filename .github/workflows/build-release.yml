@@ -167,7 +167,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          arduino-cli compile             --fqbn "${{ matrix.device.fqbn }}"             --export-binaries             --build-path "${{ matrix.device.sketch }}/build"             "${{ matrix.device.sketch }}"
+
+          EXTRA_FLAGS=""
+
+          # On tags (real releases), enforce non-dev versioning
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            EXTRA_FLAGS="-DRELEASE_BUILD=1 -DFW_VERSION=\\\"${GITHUB_REF_NAME}\\\""
+          fi
+
+          arduino-cli compile \
+            --fqbn "${{ matrix.device.fqbn }}" \
+            --export-binaries \
+            --build-path "${{ matrix.device.sketch }}/build" \
+            --build-property "compiler.cpp.extra_flags=${EXTRA_FLAGS}" \
+            "${{ matrix.device.sketch }}"
 
       # ------------------------------------------------------------
       # Build LittleFS image from data/ (IDE-like partitions.csv resolution)
