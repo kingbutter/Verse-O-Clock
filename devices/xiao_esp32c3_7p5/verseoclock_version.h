@@ -9,10 +9,6 @@
   #define FW_VERSION_IS_DEV 1
 #endif
 
-// Release safety guard:
-// CI should define RELEASE_BUILD for tagged releases.
-// Example:
-//   -DRELEASE_BUILD=1 -DFW_VERSION="\"v25.12.1\""
 #if defined(RELEASE_BUILD)
   #if defined(FW_VERSION_IS_DEV)
     #error "FW_VERSION is 'dev'. Release builds must define FW_VERSION explicitly."
