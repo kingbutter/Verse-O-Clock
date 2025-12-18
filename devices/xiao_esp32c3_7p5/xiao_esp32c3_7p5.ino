@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <time.h>
+#include <sys/time.h>
 
 // Storage / preferences
 #include <LittleFS.h>
@@ -53,6 +54,27 @@
 // QR code + compression
 #include "qrcodegen.h"
 #include "unishox2.h"
+
+// -----------------------------------------------------------------------------
+// Optional: HTTP OTA updates via GitHub Releases
+// -----------------------------------------------------------------------------
+// Enable by setting ENABLE_HTTP_OTA to 1 and defining DEVICE_ID / FW_VERSION in
+// verseoclock_version.h (shipped alongside this .ino).
+//
+// OTA flow:
+//   - Device checks a small manifest JSON hosted as a GitHub release asset
+//   - If a newer firmware is available, it downloads *_firmware.bin and flashes it
+//
+#ifndef ENABLE_HTTP_OTA
+  #define ENABLE_HTTP_OTA 1
+#endif
+
+#if ENABLE_HTTP_OTA
+  #include "verseoclock_version.h"
+  #include "verseoclock_ota.h"
+#endif
+
+#define OTA_FW_ASSET_SUFFIX "_firmware.bin"
 
 
 // PINS (adjust if needed)
@@ -184,6 +206,27 @@ static String bookName(uint16_t id) {
 // -----------------------
 static String two(int v) { return v < 10 ? "0" + String(v) : String(v); }
 
+static String fmtDatetimeLocal(uint64_t epoch) {
+  if (epoch == 0) return String("");
+  time_t tt = (time_t)epoch;
+  tm t;
+  localtime_r(&tt, &t);
+  char buf[24];
+  // YYYY-MM-DDTHH:MM (datetime-local)
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
+  return String(buf);
+}
+
+static bool setSystemTimeEpoch(uint64_t epoch) {
+  if (epoch == 0) return false;
+  timeval tv;
+  tv.tv_sec = (time_t)epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  return true;
+}
+
 static bool getPrefsClock24() {
   prefs.begin("voc", true);
   bool v = prefs.getBool("clk24", true); // default: 24-hour
@@ -197,6 +240,29 @@ static bool getPrefsGlance() {
   prefs.end();
   return v;
 }
+
+
+static bool getPrefsOffline() {
+  prefs.begin("voc", true);
+  bool v = prefs.getBool("offline", false); // default: online
+  prefs.end();
+  return v;
+}
+
+static uint64_t getPrefsManualEpoch() {
+  prefs.begin("voc", true);
+  uint64_t v = prefs.getULong64("mepoch", 0);
+  prefs.end();
+  return v;
+}
+
+static uint32_t getPrefsManualSetMs() { 
+  prefs.begin("voc", true); 
+  uint32_t v = prefs.getULong("msetms", 0); 
+  prefs.end(); 
+  return v; 
+}
+
 
 // Format time based on preference. For 12-hour, returns AM/PM separately.
 static String formatTime(const tm& t, bool& hasAmPm, String& ampmOut) {
@@ -514,6 +580,8 @@ static String getPrefsUnit() {
 
   bool clk24 = server.hasArg("clk24");
   bool glance = server.hasArg("glance");
+  bool offline = server.hasArg("offline");
+  String manualdt = server.hasArg("manualdt") ? server.arg("manualdt") : String("");
   return unit;
 }
 
@@ -562,7 +630,7 @@ static String ianaToPosixTZ(const String& ianaIn) {
   return "UTC0";
 }
 
-static void applyTimezone(const String& ianaTzIn) {
+static void applyTimezone(const String& ianaTzIn, bool enableSntp) {
   // Apply the selected timezone by setting TZ and calling tzset().
   String iana = normalizeIanaTz(ianaTzIn);
   String posix = ianaToPosixTZ(iana);
@@ -570,10 +638,12 @@ static void applyTimezone(const String& ianaTzIn) {
   setenv("TZ", posix.c_str(), 1);
   tzset();
 
-  // Most reliable on ESP32 for local time/DST behavior
-  configTzTime(posix.c_str(), "pool.ntp.org", "time.nist.gov");
+  if (enableSntp) {
+    // Most reliable on ESP32 for local time/DST behavior
+    configTzTime(posix.c_str(), "pool.ntp.org", "time.nist.gov");
+  }
 
-  Serial.printf("[tz] IANA=%s POSIX=%s\n", iana.c_str(), posix.c_str());
+  Serial.printf("[tz] IANA=%s POSIX=%s sntp=%s\n", iana.c_str(), posix.c_str(), enableSntp ? "on" : "off");
 }
 
 // -----------------------
@@ -637,6 +707,9 @@ static void handleRoot() {
   bool clock24 = getPrefsClock24();
   bool glance  = getPrefsGlance();
 
+  bool offline = getPrefsOffline();
+  uint64_t mepoch = getPrefsManualEpoch();
+  String manualDT = fmtDatetimeLocal(mepoch);
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
 
@@ -662,7 +735,7 @@ static void handleRoot() {
           ".row>*{flex:1;min-width:160px;}"
           ".hint{font-size:12px;color:var(--muted);margin-top:6px;}"
           "button.savebtn{width:100%;margin-top:14px;}"
-          "</style>"));
+          ".pill{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:12px;margin-right:6px;}</style>"));
 
   sendY(F("<script>"
           "(function(){"
@@ -674,6 +747,7 @@ static void handleRoot() {
           "window.toggleTheme=function(){const t=cur(); const n=(t==='auto')?'dark':(t==='dark')?'light':'auto'; localStorage.setItem(key,n); apply(n);};"
           "document.addEventListener('DOMContentLoaded',function(){apply(cur());});"
           "})();"
+
           "function setTzFromBrowser(){try{"
           "var t=Intl.DateTimeFormat().resolvedOptions().timeZone||''; if(!t) return;"
           "var sel=document.getElementById('tzSelect'); var hid=document.getElementById('tzHidden');"
@@ -683,33 +757,74 @@ static void handleRoot() {
           "if(!found){var o=document.createElement('option'); o.value=t; o.textContent=t+' (detected)'; o.selected=true; sel.insertBefore(o, sel.firstChild);}"
           "}"
           "}catch(e){}}"
+
           "function filterTz(){var q=(document.getElementById('tzSearch').value||'').toLowerCase().trim();"
           "var sel=document.getElementById('tzSelect'); if(!sel) return;"
           "for(var i=0;i<sel.options.length;i++){var o=sel.options[i];"
           "var tt=(o.text||'').toLowerCase(), vv=(o.value||'').toLowerCase();"
           "o.hidden=(q && tt.indexOf(q)===-1 && vv.indexOf(q)===-1);}}"
+
           "function toggleIntl(){var g=document.getElementById('intlGroup'); if(!g) return;"
           "var hid=(g.style.display==='none'); g.style.display=hid?'':'none';"
           "var b=document.getElementById('intlBtn'); if(b) b.textContent=hid?'Hide international':'Show international';}"
+
           "async function useIpLocation(){"
-          "  var btn = document.getElementById('ipBtn');"
+          "  var btn=document.getElementById('ipBtn');"
           "  if(btn){ btn.disabled=true; btn.style.opacity='0.6'; btn.textContent='Locating...'; }"
           "  try{"
-          "    const r = await fetch('/ipgeo', {cache:'no-store'});"
-          "    const j = await r.json();"
+          "    const r=await fetch('/ipgeo', {cache:'no-store'});"
+          "    const j=await r.json();"
           "    if(!j || !j.ok){ alert('IP location unavailable'); return; }"
           "    var latEl=document.getElementById('lat');"
           "    var lonEl=document.getElementById('lon');"
           "    if(!latEl || !lonEl){ alert('lat/lon inputs not found (missing id=lat / id=lon)'); return; }"
-          "    latEl.value = Number(j.lat).toFixed(6);"
-          "    lonEl.value = Number(j.lon).toFixed(6);"
+          "    latEl.value=Number(j.lat).toFixed(6);"
+          "    lonEl.value=Number(j.lon).toFixed(6);"
           "  }catch(e){"
           "    alert('IP location failed: ' + e);"
           "  }finally{"
           "    if(btn){ btn.disabled=false; btn.style.opacity='1'; btn.textContent='Use IP location'; }"
           "  }"
           "}"
+
+          "async function otaCheck(){"
+          "  const st=document.getElementById('otaStatus');"
+          "  const pill=document.getElementById('otaPill');"
+          "  if(st) st.textContent='Checking...';"
+          "  if(pill) pill.textContent='OTA: checking';"
+          "  try{"
+          "    const r=await fetch('/ota_check',{cache:'no-store'});"
+          "    const j=await r.json();"
+          "    if(!j.ok){ if(st) st.textContent='Check failed: ' + (j.err||''); if(pill) pill.textContent='OTA: error'; return; }"
+          "    const btn=document.getElementById('otaApplyBtn');"
+          "    if(j.update){"
+          "      if(st) st.textContent='Update available: ' + j.latest + ' (current ' + j.current + ')';"
+          "      if(pill) pill.textContent='OTA: ' + j.latest;"
+          "      if(pill) pill.textContent='OTA: ' + j.latest;"
+          "      if(btn) btn.disabled=false;"
+          "    } else {"
+          "      if(st) st.textContent='Up to date (' + j.current + ')';"
+          "      if(pill) pill.textContent='OTA: up to date';"
+          "      if(pill) pill.textContent='OTA: up to date';"
+          "      if(btn) btn.disabled=true;"
+          "    }"
+          "  }catch(e){ if(st) st.textContent='Check failed: ' + e; if(pill) pill.textContent='OTA: error'; }"
+          "}"
+
+          "function otaApply(){"
+          "  const st=document.getElementById('otaStatus');"
+          "  const pill=document.getElementById('otaPill');"
+          "  if(st) st.textContent='Applying update...';"
+          "  if(pill) pill.textContent='OTA: updating';"
+          "  fetch('/ota_apply').then(r=>r.text()).then(t=>{"
+          "    const pre=document.getElementById('otaLog');"
+          "    if(pre){ pre.textContent=t; pre.style.display='block'; }"
+          "    if(pill) pill.textContent='OTA: done';"
+          "  }).catch(e=>{ if(st) st.textContent='Apply failed: ' + e; if(pill) pill.textContent='OTA: error'; });"
+          "}"
+
           "</script>"));
+
 
   sendY(F("</head><body>"));
 
@@ -793,6 +908,25 @@ static void handleRoot() {
                   F("<input type='checkbox' name='clk24' value='1'>"));
   sendY(F(" 24-hour time</label>"));
 
+#if ENABLE_HTTP_OTA
+  // Firmware OTA (GitHub Releases). Kept separate from checkbox markup to avoid F() macro issues.
+  sendY(F("<div style='margin-top:10px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--card);'>"));
+  sendY(F("<div style='display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;'>"));
+  sendY(F("<div><b>Firmware Update (OTA)</b><div class='hint'>Pulls the latest release from GitHub.</div></div>"));
+  sendY(F("<div>"));
+  sendYS(String("<span class='pill'>DEVICE_ID: ") + DEVICE_ID + "</span> ");
+  sendYS(String("<span class='pill'>FW: ") + FW_VERSION + "</span>");
+  sendY(F("<span id='otaPill' class='pill'>OTA: not checked</span>"));
+  sendY(F("</div></div>"));
+  sendY(F("<div style='margin-top:8px;'>"));
+  sendY(F("<button type='button' class='smallbtn' onclick='otaCheck()'>Check for update</button>"));
+  sendY(F(" "));
+  sendY(F("<button id='otaApplyBtn' type='button' class='smallbtn' onclick='otaApply()' disabled>Apply update</button>"));
+  sendY(F("<span id='otaStatus' class='muted' style='margin-left:10px;'></span>"));
+  sendY(F("<pre id='otaLog' style='display:none;margin-top:10px;white-space:pre-wrap;'></pre>"));
+  sendY(F("</div></div>"));
+#endif
+
   // Glance mode (atomic input tag)
   sendY(F("<label style='display:flex;align-items:center;gap:10px;margin:0;padding:10px;"
           "border-radius:12px;border:1px solid var(--border);background:var(--card);'>"));
@@ -801,6 +935,34 @@ static void handleRoot() {
   sendY(F(" Glance mode (big time)</label>"));
 
   sendY(F("</div><div class='hint'>Glance mode shows a bigger clock + shorter verse snippet for across-the-room readability.</div>"));
+
+
+  // Offline mode + manual time
+  sendY(F("<h2>Offline mode</h2>"));
+  sendY(F("<div class='grid2'>"));
+
+  sendY(F("<label style='display:flex;align-items:center;gap:10px;margin:0;padding:10px;"
+          "border-radius:12px;border:1px solid var(--border);background:var(--card);'>"));
+  sendY(offline ? F("<input type='checkbox' id='offline' name='offline' value='1' checked>") :
+                  F("<input type='checkbox' id='offline' name='offline' value='1'>"));
+  sendY(F(" Offline mode (no Wi-Fi/NTP)</label>"));
+
+  sendY(F("<div>"));
+  sendY(F("<label>Manual date/time:</label>"));
+  sendYS(String("<input type='datetime-local' id='manualdt' name='manualdt' value='") + manualDT + "'/>");
+  sendY(F("</div>"));
+
+  sendY(F("</div>"));
+  sendY(F("<div class='hint'>When Offline mode is enabled, the clock uses the manual time you set here and verses still load from LittleFS. Weather and OTA are disabled.</div>"));
+
+  sendY(F("<script>"
+          "(function(){"
+          "const cb=document.getElementById('offline');"
+          "const dt=document.getElementById('manualdt');"
+          "function sync(){ if(!cb||!dt) return; dt.disabled=!cb.checked; }"
+          "if(cb){ cb.addEventListener('change',sync); sync(); }"
+          "})();"
+          "</script>"));
 
   // Save
   sendY(F("<div style='margin-top:16px; padding-bottom:32px;'>"
@@ -812,8 +974,10 @@ static void handleRoot() {
           "var g=document.getElementById('intlGroup'); if(g) g.style.display='none';"
           "var sel=document.getElementById('tzSelect'); var hid=document.getElementById('tzHidden');"
           "if(sel && hid) hid.value=sel.value;"
+          "if(typeof otaCheck==='function') otaCheck();"
           "});"
           "</script>"));
+
 
   sendY(F("</body></html>"));
 
@@ -823,8 +987,6 @@ static void handleRoot() {
 
 
 static void handleSave() {
-  // Handle POST from the config UI and persist settings to Preferences.
-  // Also applies timezone immediately so the clock updates without reboot.
   if (!server.hasArg("tz")) { server.send(400, "text/plain", "Missing tz"); return; }
 
   String tz = normalizeIanaTz(server.arg("tz"));
@@ -836,27 +998,76 @@ static void handleSave() {
   String unit = server.hasArg("unit") ? server.arg("unit") : "C";
   if (unit != "F") unit = "C";
 
-  // Display toggles (checkbox present => true)
   bool clock24 = server.hasArg("clk24");
   bool glance  = server.hasArg("glance");
 
+  bool offline = server.hasArg("offline"); // checkbox present => on
+  String manualdt = server.hasArg("manualdt") ? server.arg("manualdt") : "";
+
+  // Apply TZ immediately so mktime() interprets manualdt correctly.
+  // We pass false here so we DON'T NTP-sync yet.
+  applyTimezone(tz, false);
+
+  uint64_t mepoch = 0;
+  bool hasManual = (manualdt.length() >= 16);
+
+  if (hasManual) {
+    int Y = manualdt.substring(0, 4).toInt();
+    int M = manualdt.substring(5, 7).toInt();
+    int D = manualdt.substring(8,10).toInt();
+    int h = manualdt.substring(11,13).toInt();
+    int m = manualdt.substring(14,16).toInt();
+
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = Y - 1900;
+    t.tm_mon  = M - 1;
+    t.tm_mday = D;
+    t.tm_hour = h;
+    t.tm_min  = m;
+    t.tm_sec  = 0;
+    t.tm_isdst = -1;
+
+    time_t epochLocal = mktime(&t);
+    if (epochLocal > 0) {
+      mepoch = (uint64_t)epochLocal;
+
+      // Set system clock immediately (works great for Offline mode)
+      struct timeval tv;
+      tv.tv_sec = epochLocal;
+      tv.tv_usec = 0;
+      settimeofday(&tv, nullptr);
+    }
+  }
+
+  // Persist
   prefs.begin("voc", false);
   prefs.putString("tz", tz);
   prefs.putString("unit", unit);
   prefs.putBool("clk24", clock24);
   prefs.putBool("glance", glance);
+  prefs.putBool("offline", offline);
+
+  if (mepoch > 0) {
+    prefs.putULong64("mepoch", mepoch);
+    prefs.putULong("msetms", (uint32_t)millis());
+  }
+
   if (isfinite(lat) && isfinite(lon) && !(fabs(lat) < 0.01f && fabs(lon) < 0.01f)) {
     prefs.putFloat("lat", lat);
     prefs.putFloat("lon", lon);
   }
   prefs.end();
 
-  applyTimezone(tz);
+  // Now apply TZ again, optionally enabling NTP if NOT offline
+  applyTimezone(tz, !offline);
+
   lastWeatherFetchMs = 0;
 
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Saved");
 }
+
 
 // -----------------------
 // Rendering
@@ -1152,6 +1363,237 @@ static void handleIpGeo() {
   String resp = String("{\"ok\":true,\"lat\":") + lat + ",\"lon\":" + lon + "}";
   server.send(200, "application/json", resp);
 }
+// -----------------------------------------------------------------------------
+// OTA update endpoint
+// -----------------------------------------------------------------------------
+// Called from the config portal UI. This performs a *firmware-only* OTA check.
+//
+// Behavior:
+//   - If already up-to-date, returns a short success message.
+//   - If an update is available, the device will download it and reboot.
+//
+static void handleOtaCheck();
+static void handleOtaApply();
+
+struct OtaInfo {
+  bool ok = false;
+  String latestTag;
+  String assetUrl;
+  int assetSize = -1;
+  String err;
+};
+
+
+static bool otaGetLatestInfo(String &latestTag, String &assetUrl, int &assetSize, String &err) {
+  latestTag = "";
+  assetUrl  = "";
+  assetSize = -1;
+  err       = "";
+
+  if (WiFi.status() != WL_CONNECTED) { err = "wifi"; return false; }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  String api = String("https://api.github.com/repos/") + OTA_GH_OWNER + "/" + OTA_GH_REPO + "/releases/latest";
+  if (!http.begin(client, api)) { err = "begin"; return false; }
+
+  http.addHeader("User-Agent", "VerseOClock");
+  http.addHeader("Accept", "application/vnd.github+json");
+
+  int code = http.GET();
+  if (code != 200) {
+    err = String("http ") + code;
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // Parse tag_name
+  int t0 = body.indexOf("\"tag_name\"");
+  if (t0 < 0) { err = "no tag_name"; return false; }
+  int q1 = body.indexOf('"', body.indexOf(':', t0) + 1);
+  int q2 = body.indexOf('"', q1 + 1);
+  if (q1 < 0 || q2 < 0) { err = "tag parse"; return false; }
+  latestTag = body.substring(q1 + 1, q2);
+
+  // Find firmware asset by name
+  String want = String(DEVICE_ID) + OTA_FW_ASSET_SUFFIX;  // "_firmware.bin"
+  int p = 0;
+  while (true) {
+    int n0 = body.indexOf("\"name\"", p);
+    if (n0 < 0) break;
+    int nq1 = body.indexOf('"', body.indexOf(':', n0) + 1);
+    int nq2 = body.indexOf('"', nq1 + 1);
+    if (nq1 < 0 || nq2 < 0) break;
+    String name = body.substring(nq1 + 1, nq2);
+
+    if (name == want) {
+      int u0 = body.indexOf("\"browser_download_url\"", nq2);
+      if (u0 < 0) { err = "no url"; return false; }
+      int uq1 = body.indexOf('"', body.indexOf(':', u0) + 1);
+      int uq2 = body.indexOf('"', uq1 + 1);
+      if (uq1 < 0 || uq2 < 0) { err = "url parse"; return false; }
+      assetUrl = body.substring(uq1 + 1, uq2);
+
+      // Optional: size near this asset object
+      int s0 = body.indexOf("\"size\"", uq2);
+      if (s0 > 0 && s0 < uq2 + 2000) {
+        int colon = body.indexOf(':', s0);
+        int comma = body.indexOf(',', colon);
+        if (colon > 0 && comma > colon) assetSize = body.substring(colon + 1, comma).toInt();
+      }
+
+      return true;
+    }
+
+    p = nq2 + 1;
+  }
+
+  err = "asset not found";
+  return false;
+}
+
+static void handleOtaCheck() {
+#if !ENABLE_HTTP_OTA
+  server.send(200, "application/json", "{\"ok\":false,\"err\":\"disabled\"}");
+  return;
+#else
+  String latest, url, err;
+  int size = -1;
+
+  bool ok = otaGetLatestInfo(latest, url, size, err);
+  String cur = String(FW_VERSION);
+
+  if (!ok) {
+    server.send(200, "application/json", String("{\"ok\":false,\"err\":\"") + err + "\"}");
+    return;
+  }
+
+  bool update = (latest != cur);
+
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"current\":\"" + cur + "\",";
+  json += "\"latest\":\"" + latest + "\",";
+  json += "\"update\":" + String(update ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+#endif
+}
+
+static void handleOtaApply() {
+#if !ENABLE_HTTP_OTA
+  server.send(400, "text/plain", "OTA is disabled in this build.");
+  return;
+#else
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "text/plain", "WiFi not connected. Connect to your WiFi first, then retry.");
+    return;
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+
+  sendChunk(F("[ota] Checking latest release...\n"));
+  sendChunk(String("[ota] device=") + DEVICE_ID + " current=" + FW_VERSION + "\n");
+  server.client().flush();
+
+  String latestTag, assetUrl, err;
+  int assetSize = -1;
+
+  bool ok = otaGetLatestInfo(latestTag, assetUrl, assetSize, err);
+  if (!ok) {
+    sendChunk(String("[ota] ERROR: ") + err + "\n");
+    server.client().flush();
+    return;
+  }
+
+  sendChunk(String("[ota] latest=") + latestTag + "\n");
+  if (latestTag == String(FW_VERSION)) {
+    sendChunk(F("[ota] Up to date.\n"));
+    server.client().flush();
+    return;
+  }
+
+  sendChunk(String("[ota] downloading: ") + assetUrl + "\n");
+  if (assetSize > 0) {
+    sendChunk(String("[ota] size: ") + String(assetSize) + " bytes\n");
+  }
+  server.client().flush();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, assetUrl)) {
+    sendChunk(F("[ota] ERROR: begin download failed\n"));
+    server.client().flush();
+    return;
+  }
+
+  int code = http.GET();
+  if (code != 200) {
+    sendChunk(String("[ota] ERROR: http ") + String(code) + "\n");
+    String body = http.getString();
+    if (body.length()) {
+      sendChunk(body + "\n");
+    }
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+  int len = http.getSize();
+  WiFiClient *stream = http.getStreamPtr();
+
+  if (!Update.begin(len > 0 ? len : UPDATE_SIZE_UNKNOWN)) {
+    sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+  size_t written = Update.writeStream(*stream);
+  if (len > 0 && (int)written != len) {
+    sendChunk(String("[ota] WARN: wrote ") + String(written) + " of " + String(len) + "\n");
+  }
+
+  if (!Update.end()) {
+    sendChunk(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+  http.end();
+
+  if (!Update.isFinished()) {
+    sendChunk(F("[ota] ERROR: update not finished\n"));
+    server.client().flush();
+    return;
+  }
+
+  sendChunk(F("[ota] Success. Rebooting...\n"));
+  server.client().flush();
+  delay(250);
+  ESP.restart();
+#endif
+}
+
+// Back-compat: keep /ota endpoint as "apply update"
+static void handleOta() {
+  handleOtaApply();
+}
+
+
 
 
 
@@ -1178,7 +1620,7 @@ void setup() {
   Serial.println(fsOk ? "[FS] Ready" : "[FS] Not ready");
 
   // Timezone
-  applyTimezone(getPrefsTz());
+  applyTimezone(getPrefsTz(), !getPrefsOffline());
 
   // WiFiManager (non-blocking)
   wm.setConfigPortalBlocking(false);
@@ -1212,35 +1654,89 @@ void loop() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/ipgeo", HTTP_GET, handleIpGeo);
+#if ENABLE_HTTP_OTA
+    server.on("/ota_check", HTTP_GET, handleOtaCheck);
+    server.on("/ota_apply", HTTP_GET, handleOtaApply);
+    server.on("/ota", HTTP_GET, handleOta); // back-compat
+#endif
     server.begin();
     Serial.println("[STA] Config server started on port 80");
     serverStarted = true;
   }
 
-  // Weather refresh every 30 min
-  if (lastWeatherFetchMs == 0 || (millis() - lastWeatherFetchMs) > 30UL * 60UL * 1000UL) {
-    if (fetchWeather()) {
-      Serial.printf("[WX] temp=%.1fC code=%d\n", weatherTempC, weatherCode);
-    } else {
-      weatherOk = false;
-      Serial.println("[WX] fetch failed (set lat/lon in config page)");
+  // Weather refresh every 30 min (online only)
+  if (!getPrefsOffline() && WiFi.isConnected()) {
+    if (lastWeatherFetchMs == 0 || (millis() - lastWeatherFetchMs) > 30UL * 60UL * 1000UL) {
+      if (fetchWeather()) {
+        Serial.printf("[WX] temp=%.1fC code=%d", weatherTempC, weatherCode);
+      } else {
+        weatherOk = false;
+        Serial.println("[WX] fetch failed (set lat/lon in config page)");
+      }
+      lastWeatherFetchMs = millis();
     }
-    lastWeatherFetchMs = millis();
   }
 
-  tm t;
-  if (!getLocalTime(&t)) return;
+  // Time
+  tm t{};
+  bool offline = getPrefsOffline();
+  if (offline) {
+    uint64_t me = getPrefsManualEpoch();
+    if (me == 0) {
+      // Edge case: offline mode enabled but no manual time set yet.
+      static bool shown = false;
+      if (!shown) {
+        display.setFullWindow();
+        display.firstPage();
+        do {
+          display.fillScreen(GxEPD_WHITE);
+          display.setTextColor(GxEPD_BLACK);
+          display.setFont(&FreeSans12pt7b);
+          display.setCursor(20, 70);
+          display.print("Offline mode");
+          display.setFont(&FreeSans9pt7b);
+          display.setCursor(20, 110);
+          display.print("Manual time not set.");
+          display.setCursor(20, 140);
+          display.print("Connect to the setup portal");
+          display.setCursor(20, 170);
+          display.print("and set a date/time.");
+        } while (display.nextPage());
+        shown = true;
+      }
+      delay(100);
+      return;
+    }
+    time_t now = time(nullptr);
+    localtime_r(&now, &t);
+  } else {
+    if (!getLocalTime(&t)) return;
+  }
 
   if (t.tm_min == lastRenderedMinute) return;
   lastRenderedMinute = t.tm_min;
 
-  int slot = slotIndexFromTime(t.tm_hour, t.tm_min);
+int slot = slotIndexFromTime(t.tm_hour, t.tm_min);
 
-  String verseText;
-  uint16_t bookId = 0, chap = 0, vs = 0;
-  bool ok = false;
+String verseText;
+uint16_t bookId = 0, chap = 0, vs = 0;
+bool ok = false;
 
-  if (fsOk) ok = loadVerse(slot, verseText, bookId, chap, vs);
+if (fsOk) {
+  // Primary: 24-hour slot
+  ok = loadVerse(slot, verseText, bookId, chap, vs);
 
-  renderHomeScreen(t, ok ? verseText : String(""), bookId, chap, vs);
+  // Fallback: if PM slot missing, try 12-hour equivalent (21:53 -> 9:53)
+  if (!ok && t.tm_hour > 12) {
+    int slot12 = slotIndexFromTime(t.tm_hour - 12, t.tm_min);
+    ok = loadVerse(slot12, verseText, bookId, chap, vs);
+
+    // Optional debug
+    // if (ok) Serial.printf("[verse] fallback %02d:%02d -> %02d:%02d\n",
+    //                       t.tm_hour, t.tm_min, t.tm_hour - 12, t.tm_min);
+  }
+}
+
+renderHomeScreen(t, ok ? verseText : String(""), bookId, chap, vs);
+
 }
