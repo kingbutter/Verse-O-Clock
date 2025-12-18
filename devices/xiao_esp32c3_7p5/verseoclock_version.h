@@ -24,3 +24,15 @@
 #ifndef FW_VERSION
   #define FW_VERSION "dev"
 #endif
+
+// -----------------------------------------------------------------------------
+// Release safety guard
+// -----------------------------------------------------------------------------
+// If OTA is enabled, do not allow a release build with FW_VERSION="dev".
+// This prevents accidentally shipping a dev firmware to GitHub Releases.
+//
+#if defined(ENABLE_HTTP_OTA)
+  #if FW_VERSION[0] == 'd'
+    #error "FW_VERSION is 'dev'. Release builds must define FW_VERSION explicitly."
+  #endif
+#endif

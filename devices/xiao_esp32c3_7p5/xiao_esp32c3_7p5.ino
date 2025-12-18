@@ -69,11 +69,16 @@
   #define ENABLE_HTTP_OTA 1
 #endif
 
+// -----------------------------------------------------------------------------
+// OTA configuration (GitHub Releases)
+// -----------------------------------------------------------------------------
+#define OTA_GH_OWNER "kingbutter"
+#define OTA_GH_REPO  "Verse-O-Clock"
+#define OTA_FW_ASSET_SUFFIX "_firmware.bin"
+
 #if ENABLE_HTTP_OTA
   #include "verseoclock_version.h"
 #endif
-
-#define OTA_FW_ASSET_SUFFIX "_firmware.bin"
 
 
 // PINS (adjust if needed)
