@@ -47,16 +47,18 @@ jobs:
               busy_patch = False
             else:
               busy_patch = str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
-            display = d.get("display", {}) or {}
-            busy_level = (display.get("busy_level", "HIGH") or "HIGH").strip().upper()
+
+              display = d.get("display", {}) or {}
             driver_class = display.get("driver_class", "")
-            
+            busy_level = (display.get("busy_level", "HIGH") or "HIGH").strip().upper()
+
             include.append({
               "id": device_id,
               "sketch": sketch,
               "fqbn": fqbn,
               "busy_patch": busy_patch,
               "driver_class": driver_class,
+              "busy_level": busy_level,
             })
 
           out = {"device": include}
