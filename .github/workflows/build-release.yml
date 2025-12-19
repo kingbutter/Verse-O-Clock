@@ -48,7 +48,7 @@ jobs:
             else:
               busy_patch = str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
-              display = d.get("display", {}) or {}
+            display = d.get("display", {}) or {}
             driver_class = display.get("driver_class", "")
             busy_level = (display.get("busy_level", "HIGH") or "HIGH").strip().upper()
 
