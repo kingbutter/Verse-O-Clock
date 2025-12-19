@@ -50,6 +50,7 @@ jobs:
             display = d.get("display", {}) or {}
             busy_level = (display.get("busy_level", "HIGH") or "HIGH").strip().upper()
             driver_class = display.get("driver_class", "")
+            
             include.append({
               "id": device_id,
               "sketch": sketch,
