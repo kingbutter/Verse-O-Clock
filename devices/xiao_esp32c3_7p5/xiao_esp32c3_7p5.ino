@@ -147,6 +147,43 @@ Preferences prefs;
 WebServer server(80);
 WiFiManager wm;
 
+
+
+// -----------------------
+// WiFiManager custom params (so first-run setup can configure everything
+// without needing to connect again after WiFi is saved)
+// -----------------------
+static bool wmShouldSaveParams = false;
+static bool wmParamsSavedOnce = false;
+
+// Backing buffers must outlive the portal when using non-blocking WiFiManager.
+static char wm_lat[18]    = {0};
+static char wm_lon[18]    = {0};
+static char wm_tz[64]     = {0};
+static char wm_unit[3]    = {0};
+static char wm_clk24[3]   = {0};  // "1" or "0"
+static char wm_glance[3]  = {0};  // "1" or "0"
+static char wm_offline[3] = {0};  // "1" or "0"
+// datetime-local style string "YYYY-MM-DDThh:mm"
+static char wm_manualdt[22] = {0};
+
+static WiFiManagerParameter* p_lat = nullptr;
+static WiFiManagerParameter* p_lon = nullptr;
+static WiFiManagerParameter* p_tz = nullptr;
+static WiFiManagerParameter* p_unit = nullptr;
+static WiFiManagerParameter* p_clk24 = nullptr;
+static WiFiManagerParameter* p_glance = nullptr;
+static WiFiManagerParameter* p_offline = nullptr;
+static WiFiManagerParameter* p_manualdt = nullptr;
+
+// Called when user hits "Save" on WiFiManager portal.
+static void wmSaveCallback() { wmShouldSaveParams = true; }
+
+// Forward decls
+static void initWiFiManagerCustomParams();
+static void persistWiFiManagerCustomParamsIfNeeded();
+static void startWiFiManagerPortal(bool wipeWifi);
+
 bool fsOk = false;
 bool contentOk = false;
 static unsigned long lastContentAttemptMs = 0;
@@ -1796,6 +1833,185 @@ static void handleOta() {
 // -----------------------
 // setup / loop
 // -----------------------
+
+// -----------------------
+// WiFiManager custom params helpers
+// -----------------------
+static void initWiFiManagerCustomParams() {
+  // Fill buffers from prefs (or defaults) so portal shows current values.
+  float lat = 0, lon = 0;
+  bool hasLL = getPrefsLatLon(lat, lon);
+
+  String tz = getPrefsTz();
+  if (tz.length() == 0) tz = "America/Indiana/Indianapolis";
+
+  String unit = getPrefsUnit();
+  if (unit != "C" && unit != "F") unit = "F";
+
+  bool clock24 = getPrefsClock24();
+  bool glance  = getPrefsGlance();
+  bool offline = getPrefsOffline();
+
+  // Manual dt value (from stored epoch) in datetime-local format if available.
+  uint64_t mepoch = getPrefsManualEpoch();
+  String manualDT = fmtDatetimeLocal(mepoch); // should return "" if mepoch==0
+  if (manualDT.length() == 0) manualDT = "";
+
+  // Copy into fixed buffers
+  memset(wm_lat, 0, sizeof(wm_lat));
+  memset(wm_lon, 0, sizeof(wm_lon));
+  memset(wm_tz,  0, sizeof(wm_tz));
+  memset(wm_unit,0, sizeof(wm_unit));
+  memset(wm_clk24,0,sizeof(wm_clk24));
+  memset(wm_glance,0,sizeof(wm_glance));
+  memset(wm_offline,0,sizeof(wm_offline));
+  memset(wm_manualdt,0,sizeof(wm_manualdt));
+
+  if (hasLL) {
+    snprintf(wm_lat, sizeof(wm_lat), "%.6f", lat);
+    snprintf(wm_lon, sizeof(wm_lon), "%.6f", lon);
+  }
+  strlcpy(wm_tz, tz.c_str(), sizeof(wm_tz));
+  strlcpy(wm_unit, unit.c_str(), sizeof(wm_unit));
+  strlcpy(wm_clk24,  clock24 ? "1" : "0", sizeof(wm_clk24));
+  strlcpy(wm_glance, glance  ? "1" : "0", sizeof(wm_glance));
+  strlcpy(wm_offline,offline ? "1" : "0", sizeof(wm_offline));
+  strlcpy(wm_manualdt, manualDT.c_str(), sizeof(wm_manualdt));
+
+  // Free any existing params (defensive, in case portal is restarted)
+  delete p_lat; delete p_lon; delete p_tz; delete p_unit;
+  delete p_clk24; delete p_glance; delete p_offline; delete p_manualdt;
+  p_lat = p_lon = p_tz = p_unit = p_clk24 = p_glance = p_offline = p_manualdt = nullptr;
+
+  // Add a short note + fields. (WiFiManagerParameter supports "custom html" via the 1-arg ctor.)
+  // Keep it simple: text inputs for tz/unit and 0/1 for toggles.
+  p_tz     = new WiFiManagerParameter("tz",      "Timezone (IANA, e.g. America/Indiana/Indianapolis)", wm_tz, 63);
+  p_lat    = new WiFiManagerParameter("lat",     "Latitude (optional)",  wm_lat, 17);
+  p_lon    = new WiFiManagerParameter("lon",     "Longitude (optional)", wm_lon, 17);
+  p_unit   = new WiFiManagerParameter("unit",    "Units (F or C)", wm_unit, 2);
+  p_clk24  = new WiFiManagerParameter("clk24",   "24-hour clock? (1 or 0)", wm_clk24, 2);
+  p_glance = new WiFiManagerParameter("glance",  "Glance mode? (1 or 0)", wm_glance, 2);
+  p_offline= new WiFiManagerParameter("offline", "Offline mode? (1 or 0)", wm_offline, 2);
+  p_manualdt = new WiFiManagerParameter("manualdt", "Manual time (YYYY-MM-DDThh:mm, used when Offline=1)", wm_manualdt, 21);
+
+  wm.addParameter(p_tz);
+  wm.addParameter(p_lat);
+  wm.addParameter(p_lon);
+  wm.addParameter(p_unit);
+  wm.addParameter(p_clk24);
+  wm.addParameter(p_glance);
+  wm.addParameter(p_offline);
+  wm.addParameter(p_manualdt);
+
+  wm.setSaveConfigCallback(wmSaveCallback);
+}
+
+
+static void persistWiFiManagerCustomParamsIfNeeded() {
+  if (!wmShouldSaveParams) return;
+
+  // Save once per "Save" action.
+  wmShouldSaveParams = false;
+  wmParamsSavedOnce = true;
+
+  // Pull values from portal fields.
+  String tzRaw   = p_tz ? String(p_tz->getValue()) : "";
+  String tz      = normalizeIanaTz(tzRaw);
+  if (!tz.length()) tz = getPrefsTz();
+
+  String unit = p_unit ? String(p_unit->getValue()) : "";
+  unit.trim();
+  if (unit != "F") unit = "C";
+
+  String latS = p_lat ? String(p_lat->getValue()) : "";
+  String lonS = p_lon ? String(p_lon->getValue()) : "";
+
+  bool clock24 = p_clk24 ? (String(p_clk24->getValue()) == "1") : getPrefsClock24();
+  bool glance  = p_glance ? (String(p_glance->getValue()) == "1") : getPrefsGlance();
+  bool offline = p_offline ? (String(p_offline->getValue()) == "1") : getPrefsOffline();
+
+  String manualdt = p_manualdt ? String(p_manualdt->getValue()) : "";
+  manualdt.trim();
+
+  // Apply TZ immediately so mktime() interprets manualdt correctly.
+  // We pass false here so we DON'T NTP-sync yet.
+  applyTimezone(tz, false);
+
+  uint64_t mepoch = 0;
+  bool hasManual = (manualdt.length() >= 16);
+  if (hasManual) {
+    int Y = manualdt.substring(0, 4).toInt();
+    int M = manualdt.substring(5, 7).toInt();
+    int D = manualdt.substring(8,10).toInt();
+    int h = manualdt.substring(11,13).toInt();
+    int m = manualdt.substring(14,16).toInt();
+
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = Y - 1900;
+    t.tm_mon  = M - 1;
+    t.tm_mday = D;
+    t.tm_hour = h;
+    t.tm_min  = m;
+    t.tm_sec  = 0;
+    t.tm_isdst = -1;
+
+    time_t epochLocal = mktime(&t);
+    if (epochLocal > 0) {
+      mepoch = (uint64_t)epochLocal;
+      // Set system clock immediately (works great for Offline mode)
+      struct timeval tv;
+      tv.tv_sec = epochLocal;
+      tv.tv_usec = 0;
+      settimeofday(&tv, nullptr);
+    }
+  }
+
+  // Persist (same keys as /save)
+  prefs.begin("voc", false);
+  prefs.putString("tz", tz);
+  prefs.putString("unit", unit);
+  prefs.putBool("clk24", clock24);
+  prefs.putBool("glance", glance);
+  prefs.putBool("offline", offline);
+
+  if (mepoch > 0) {
+    prefs.putULong64("mepoch", mepoch);
+    prefs.putULong("msetms", (uint32_t)millis());
+  }
+
+  if (latS.length() && lonS.length()) {
+    float lat = latS.toFloat();
+    float lon = lonS.toFloat();
+    if (isfinite(lat) && isfinite(lon) && !(fabs(lat) < 0.01f && fabs(lon) < 0.01f)) {
+      prefs.putFloat("lat", lat);
+      prefs.putFloat("lon", lon);
+    }
+  }
+  prefs.end();
+
+  // Now apply TZ again, optionally enabling NTP if NOT offline
+  applyTimezone(tz, !offline);
+
+  Serial.println("[wifi] saved custom params from WiFiManager portal");
+}
+
+
+static void startWiFiManagerPortal(bool wipeWifi) {
+  if (wipeWifi) {
+    Serial.println("[wifi] wiping WiFi credentials and starting portal");
+    wm.resetSettings();
+  } else {
+    Serial.println("[wifi] starting portal");
+  }
+
+  initWiFiManagerCustomParams();
+
+  // Keep non-blocking behavior so the device loop can keep running.
+  wm.setConfigPortalBlocking(false);
+  wm.startConfigPortal(SETUP_AP_SSID);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(100);
@@ -1819,6 +2035,8 @@ void setup() {
   applyTimezone(getPrefsTz(), !getPrefsOffline());
 
   // WiFiManager (non-blocking)
+  initWiFiManagerCustomParams();
+
   wm.setConfigPortalBlocking(false);
 
   bool ok = wm.autoConnect(SETUP_AP_SSID);
@@ -1832,6 +2050,7 @@ void setup() {
 
 void loop() {
   wm.process();
+  persistWiFiManagerCustomParamsIfNeeded();
   server.handleClient();
 
   static bool serverStarted = false;
@@ -1850,6 +2069,16 @@ void loop() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/ipgeo", HTTP_GET, handleIpGeo);
+    server.on("/wifi", HTTP_GET, []() {
+      server.send(200, "text/plain", "Starting WiFi setup portal (keep existing credentials)...");
+      delay(100);
+      startWiFiManagerPortal(false);
+    });
+    server.on("/wifi_reset", HTTP_GET, []() {
+      server.send(200, "text/plain", "Starting WiFi setup portal (WiFi reset)...");
+      delay(100);
+      startWiFiManagerPortal(true);
+    });
 #if ENABLE_HTTP_OTA
     server.on("/ota_check", HTTP_GET, handleOtaCheck);
     server.on("/ota_apply", HTTP_GET, handleOtaApply);

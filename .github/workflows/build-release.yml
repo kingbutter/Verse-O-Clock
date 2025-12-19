@@ -254,12 +254,39 @@ jobs:
           SKETCH_DIR="${{ matrix.device.sketch }}"
           DATA_DIR="$SKETCH_DIR/data"
 
-          # Pick the main firmware .bin from the build output (skip littlefs if present)
-          BIN_PATH="$(find "$SKETCH_DIR/build" -type f -name '*.bin' ! -name '*littlefs*' | head -n 1)"
-          test -f "$BIN_PATH"
+          # Pick the OTA-safe application binary (Arduino/ESP32 produces *.ino.bin for the sketch)
+          APP_BIN="$(find "$SKETCH_DIR/build" -type f -name '*.ino.bin' | head -n 1)"
+          if [[ -z "${APP_BIN}" || ! -f "${APP_BIN}" ]]; then
+            echo "ERROR: Could not find app binary (*.ino.bin) in $SKETCH_DIR/build"
+            echo "Found these .bin files:"
+            find "$SKETCH_DIR/build" -type f -name '*.bin' -maxdepth 3 -print || true
+            exit 1
+          fi
+
+          # Guardrail: never ship a full-flash image as OTA (4MB on XIAO ESP32-C3)
+          APP_SIZE="$(stat -c%s "${APP_BIN}")"
+          if [[ "${APP_SIZE}" -ge 3000000 ]]; then
+            echo "ERROR: App binary is suspiciously large (${APP_SIZE} bytes). Refusing to publish as OTA."
+            echo "This usually means you picked a merged/full-flash bin."
+            exit 1
+          fi
 
           mkdir -p dist
-          cp -v "$BIN_PATH" "dist/${{ matrix.device.id }}_firmware.bin"
+          cp -v "${APP_BIN}" "dist/${{ matrix.device.id }}_firmware.bin"
+
+          # --- Optional USB recovery artifacts (NOT for OTA) ---
+
+          BOOT_BIN="$(find "$SKETCH_DIR/build" -type f -name '*bootloader*.bin' | head -n 1 || true)"
+          PART_BIN="$(find "$SKETCH_DIR/build" -type f -name '*partitions*.bin' | head -n 1 || true)"
+
+          if [[ -f "$BOOT_BIN" ]]; then
+            cp -v "$BOOT_BIN" "dist/${{ matrix.device.id }}_bootloader.bin"
+          fi
+
+          if [[ -f "$PART_BIN" ]]; then
+            cp -v "$PART_BIN" "dist/${{ matrix.device.id }}_partitions.bin"
+          fi
+
 
           # Always include the littlefs image built earlier
           test -f "dist/${{ matrix.device.id }}_littlefs.bin"
