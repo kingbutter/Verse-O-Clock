@@ -110,16 +110,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Common libs (add/remove as needed)
+          # Needed for --git-url installs with arduino-cli >= 1.4
+          arduino-cli config set library.enable_unsafe_install true
           arduino-cli lib update-index
-          arduino-cli lib install "ArduinoJson" || true
-          arduino-cli lib install "WiFiManager" || true
 
-          # Unishox (siara-cc) — clone into Arduino/libraries to be safe
-          mkdir -p "$HOME/Arduino/libraries"
-          if [ ! -d "$HOME/Arduino/libraries/Unishox_Arduino_lib" ]; then
-            git clone --depth 1 https://github.com/siara-cc/Unishox_Arduino_lib.git "$HOME/Arduino/libraries/Unishox_Arduino_lib"
-          fi
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "GxEPD2"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "ArduinoJson"
+          # Force Unishox from upstream GitHub repo
+          arduino-cli lib install --git-url https://github.com/siara-cc/Unishox_Arduino_lib.git
 
       - name: Install Python dependencies (helpers)
         shell: bash
