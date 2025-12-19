@@ -121,6 +121,14 @@ jobs:
             git clone --depth 1 https://github.com/siara-cc/Unishox_Arduino_lib.git "$HOME/Arduino/libraries/Unishox_Arduino_lib"
           fi
 
+      - name: Install Python dependencies (helpers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          pip install -r helpers/requirements.txt
+
+
       - name: Generate verse content (toc/entries/texts)
         shell: bash
         run: |
