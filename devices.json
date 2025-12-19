@@ -5,6 +5,7 @@
       "id": "xiao_esp32c3_7p5",
       "name": "XIAO ESP32-C3 + 7.5in ePaper",
       "board": "esp32:esp32:XIAO_ESP32C3",
+      "driver_class": "GxEPD2_750_GDEY075T7",
       "partition_scheme": "huge_app",
       "display": {
         "type": "epaper",

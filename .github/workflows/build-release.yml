@@ -47,12 +47,15 @@ jobs:
               busy_patch = False
             else:
               busy_patch = str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+            
+            driver_class = d.get("driver_class", "")
 
             include.append({
               "id": device_id,
               "sketch": sketch,
               "fqbn": fqbn,
               "busy_patch": busy_patch,
+              "driver_class": driver_class,
             })
 
           out = {"device": include}
@@ -116,43 +119,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Patching GxEPD2 BUSY polarity for ${{ matrix.device.id }} (targeting 7.5\" T7 drivers)."
+          echo "Patching GxEPD2 BUSY polarity for ${{ matrix.device.id }} driver_class=${{ matrix.device.driver_class }}"
 
           python - <<'PY'
           from pathlib import Path
-          import re
+          import re, json, subprocess
 
-          # Try common library locations (repo-local first, then sketchbook)
+          driver = "${{ matrix.device.driver_class }}".strip()
+          if not driver:
+            raise SystemExit("ERROR: matrix.device.driver_class is empty. Set display.driver_class in devices.json.")
+
+          cfg = json.loads(subprocess.check_output(["arduino-cli","config","dump","--format","json"], text=True))
+          sketchbook = Path(cfg["directories"]["user"])
+
           roots = [
             Path.cwd() / "libraries" / "GxEPD2",
-            Path.home() / "Arduino" / "libraries" / "GxEPD2",
+            Path.cwd() / "${{ matrix.device.sketch }}" / "libraries" / "GxEPD2",
+            sketchbook / "libraries" / "GxEPD2",
           ]
           roots = [r for r in roots if r.exists()]
           if not roots:
-            raise SystemExit("ERROR: GxEPD2 not found in ./libraries or ~/Arduino/libraries")
+            raise SystemExit("ERROR: GxEPD2 not found in repo-local, sketch-local, or sketchbook libraries.")
 
-          target_classes = ("class GxEPD2_750_GDEY075T7", "class GxEPD2_750_T7")
+          needle = f"class {driver}"
+          matches = []
 
-          candidates = []
-          for lib_root in roots:
-            src = lib_root / "src"
+          for root in roots:
+            src = root / "src"
             if not src.exists():
               continue
             for f in src.rglob("*.h"):
               t = f.read_text(encoding="utf-8", errors="ignore")
-              if any(c in t for c in target_classes):
-                candidates.append(f)
+              if needle in t:
+                matches.append(f)
 
-          if len(candidates) != 1:
+          if len(matches) != 1:
             raise SystemExit(
-              "ERROR: Expected exactly 1 driver header for the T7 panel, found "
-              f"{len(candidates)}:\n" + "\n".join(str(p) for p in candidates)
+              f"ERROR: Expected exactly 1 header containing '{needle}', found {len(matches)}:\n" +
+              "\n".join(str(p) for p in matches)
             )
 
-          target = candidates[0]
+          target = matches[0]
           text = target.read_text(encoding="utf-8", errors="ignore")
 
-          # Patch LOW -> HIGH for busy_level and _busy_level
+          # Flip busy polarity: LOW -> HIGH
           new = re.sub(r"(\bbusy_level\s*=\s*)LOW\b", r"\1HIGH", text)
           new = re.sub(r"(\b_busy_level\s*=\s*)LOW\b", r"\1HIGH", new)
 
@@ -162,12 +172,10 @@ jobs:
           target.write_text(new, encoding="utf-8")
           print(f"Patched BUSY polarity in: {target}")
 
-          # Print proof lines
-          patched = target.read_text(encoding="utf-8", errors="ignore").splitlines()
-          for line in patched:
-            if "busy_level" in line or "_busy_level" in line:
-              if "LOW" in line or "HIGH" in line:
-                print("[line]", line.strip())
+          # Proof lines
+          for line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "busy_level" in line and ("LOW" in line or "HIGH" in line):
+              print("[line]", line.strip())
           PY
 
 
