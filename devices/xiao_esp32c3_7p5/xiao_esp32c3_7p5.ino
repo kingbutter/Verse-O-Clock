@@ -76,6 +76,22 @@
 #define OTA_GH_REPO  "Verse-O-Clock"
 #define OTA_FW_ASSET_SUFFIX "_firmware.bin"
 
+
+// -----------------------------------------------------------------------------
+// Verse content repository (raw GitHub)
+// -----------------------------------------------------------------------------
+// The device downloads these files into LittleFS when they are missing.
+// Repo should contain (at repo root): toc.bin, entries.bin, texts.bin, manifest.json
+#define CONTENT_GH_OWNER "kingbutter"
+#define CONTENT_GH_REPO  "Verse-O-Clock-Content"
+#define CONTENT_GH_BRANCH "main"
+#define CONTENT_BASE_URL "https://raw.githubusercontent.com/" CONTENT_GH_OWNER "/" CONTENT_GH_REPO "/" CONTENT_GH_BRANCH
+#define CONTENT_TOC_URL     String(CONTENT_BASE_URL) + "/toc.bin"
+#define CONTENT_ENTRIES_URL String(CONTENT_BASE_URL) + "/entries.bin"
+#define CONTENT_TEXTS_URL   String(CONTENT_BASE_URL) + "/texts.bin"
+#define CONTENT_MANIFEST_URL String(CONTENT_BASE_URL) + "/manifest.json"
+
+
 #if ENABLE_HTTP_OTA
   #include "verseoclock_version.h"
 #endif
@@ -132,6 +148,8 @@ WebServer server(80);
 WiFiManager wm;
 
 bool fsOk = false;
+bool contentOk = false;
+static unsigned long lastContentAttemptMs = 0;
 bool didFirstFullRefresh = false;
 int lastRenderedMinute = -1;
 
@@ -163,6 +181,114 @@ static void forceLandscape();
 static void drawQRCode(int x, int y, int scale, const char* text);
 static void showSetupScreen();
 static bool mountFS();
+
+// -----------------------
+// Verse content download (toc/entries/texts) into LittleFS
+// -----------------------
+static bool httpDownloadToLittleFS(const String& url, const char* destPath) {
+  // Downloads a URL to LittleFS as destPath using a temporary file + rename.
+  // Returns true on success.
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String tmpPath = String(destPath) + ".tmp";
+
+  WiFiClientSecure client;
+  client.setInsecure(); // pragmatic default; replace with CA pinning if desired
+
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    Serial.printf("[content] http.begin failed: %s\n", url.c_str());
+    return false;
+  }
+
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[content] GET %s -> %d\n", url.c_str(), code);
+    http.end();
+    return false;
+  }
+
+  int remaining = http.getSize(); // may be -1 for chunked
+  WiFiClient* stream = http.getStreamPtr();
+
+  File f = LittleFS.open(tmpPath, "w");
+  if (!f) {
+    Serial.printf("[content] open failed: %s\n", tmpPath.c_str());
+    http.end();
+    return false;
+  }
+
+  const size_t BUF_SZ = 1024;
+  uint8_t buf[BUF_SZ];
+  size_t written = 0;
+
+  unsigned long start = millis();
+  while (http.connected() && (remaining > 0 || remaining == -1)) {
+    size_t avail = stream->available();
+    if (avail) {
+      int toRead = (avail > BUF_SZ) ? (int)BUF_SZ : (int)avail;
+      int r = stream->readBytes((char*)buf, toRead);
+      if (r <= 0) break;
+
+      if (f.write(buf, (size_t)r) != (size_t)r) {
+        Serial.printf("[content] write failed at %u bytes\n", (unsigned)written);
+        f.close();
+        http.end();
+        LittleFS.remove(tmpPath);
+        return false;
+      }
+
+      written += (size_t)r;
+      if (remaining > 0) remaining -= r;
+    } else {
+      delay(1);
+    }
+
+    // safety timeout (30s)
+    if (millis() - start > 30000UL) {
+      Serial.println("[content] download timeout");
+      break;
+    }
+  }
+
+  f.close();
+  http.end();
+
+  if (written == 0) {
+    Serial.printf("[content] zero bytes written for %s\n", destPath);
+    LittleFS.remove(tmpPath);
+    return false;
+  }
+
+  // Replace existing atomically-ish (tmp -> final)
+  if (LittleFS.exists(destPath)) LittleFS.remove(destPath);
+  if (!LittleFS.rename(tmpPath, destPath)) {
+    Serial.printf("[content] rename failed: %s -> %s\n", tmpPath.c_str(), destPath);
+    LittleFS.remove(tmpPath);
+    return false;
+  }
+
+  Serial.printf("[content] wrote %s (%u bytes)\n", destPath, (unsigned)written);
+  return true;
+}
+
+static bool ensureVerseContentPresent() {
+  // If verse bin files are missing, download them from CONTENT_* URLs.
+  // Returns true if all required files exist after this call.
+  bool have = LittleFS.exists("/toc.bin") && LittleFS.exists("/entries.bin") && LittleFS.exists("/texts.bin");
+  if (have) return true;
+
+  Serial.println("[content] missing verse bins; attempting download from content repo");
+
+  bool ok1 = LittleFS.exists("/toc.bin")     || httpDownloadToLittleFS(CONTENT_TOC_URL, "/toc.bin");
+  bool ok2 = LittleFS.exists("/entries.bin") || httpDownloadToLittleFS(CONTENT_ENTRIES_URL, "/entries.bin");
+  bool ok3 = LittleFS.exists("/texts.bin")   || httpDownloadToLittleFS(CONTENT_TEXTS_URL, "/texts.bin");
+
+  bool ok = ok1 && ok2 && ok3;
+  Serial.println(ok ? "[content] content ready" : "[content] content download failed");
+  return ok;
+}
+
 static bool loadToc();
 static bool decodeUnishox(const uint8_t* comp, uint16_t compLen, uint16_t origLen, String& out);
 static bool loadVerse(int slot, String& verseText, uint16_t& bookId, uint16_t& chap, uint16_t& vs);
@@ -409,19 +535,29 @@ static bool mountFS() {
   const char* basePath = "/littlefs";
   const uint8_t maxOpen = 10;
 
-  // Try custom partition label first
+  // Prefer our explicit partition label.
   if (LittleFS.begin(false, basePath, maxOpen, "littlefs")) {
     Serial.println("[FS] Mounted LittleFS partitionLabel='littlefs'");
     return true;
   }
+  Serial.println("[FS] Mount failed for partitionLabel='littlefs' — attempting format...");
+  if (LittleFS.begin(true, basePath, maxOpen, "littlefs")) { // format-on-fail
+    Serial.println("[FS] Formatted + mounted LittleFS partitionLabel='littlefs'");
+    return true;
+  }
 
-  // Common Arduino default label
+  // Fallback: some core/boards use the default 'spiffs' label for the FS partition.
   if (LittleFS.begin(false, basePath, maxOpen, "spiffs")) {
     Serial.println("[FS] Mounted LittleFS partitionLabel='spiffs'");
     return true;
   }
+  Serial.println("[FS] Mount failed for partitionLabel='spiffs' — attempting format...");
+  if (LittleFS.begin(true, basePath, maxOpen, "spiffs")) { // format-on-fail
+    Serial.println("[FS] Formatted + mounted LittleFS partitionLabel='spiffs'");
+    return true;
+  }
 
-  Serial.println("[FS] LittleFS mount failed (no format performed)");
+  Serial.println("[FS] LittleFS mount failed (even after format-on-fail)");
   return false;
 }
 
@@ -1527,7 +1663,7 @@ static void handleOtaApply() {
 
   sendChunk(String("[ota] downloading: ") + assetUrl + "\n");
   if (assetSize > 0) {
-    sendChunk(String("[ota] size: ") + String(assetSize) + " bytes\n");
+    sendChunk(String("[ota] declared size: ") + String(assetSize) + " bytes\n");
   }
   server.client().flush();
 
@@ -1536,14 +1672,31 @@ static void handleOtaApply() {
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
 
   if (!http.begin(client, assetUrl)) {
-    sendChunk(F("[ota] ERROR: begin download failed\n"));
+    sendChunk(F("[ota] ERROR: http.begin failed\n"));
     server.client().flush();
     return;
   }
 
   int code = http.GET();
+
+  // Log basics (Serial + web)
+  {
+    String ct = http.header("Content-Type");
+    int len0 = http.getSize();
+    Serial.printf("[ota] URL: %s\n", assetUrl.c_str());
+    Serial.printf("[ota] HTTP code: %d\n", code);
+    Serial.printf("[ota] Content-Length: %d\n", len0);
+    Serial.printf("[ota] Content-Type: %s\n", ct.c_str());
+
+    sendChunk(String("[ota] HTTP code: ") + code + "\n");
+    sendChunk(String("[ota] Content-Length: ") + len0 + "\n");
+    if (ct.length()) sendChunk(String("[ota] Content-Type: ") + ct + "\n");
+    server.client().flush();
+  }
+
   if (code != 200) {
     sendChunk(String("[ota] ERROR: http ") + String(code) + "\n");
     String body = http.getString();
@@ -1556,22 +1709,61 @@ static void handleOtaApply() {
   }
 
   int len = http.getSize();
-  WiFiClient *stream = http.getStreamPtr();
-
-  if (!Update.begin(len > 0 ? len : UPDATE_SIZE_UNKNOWN)) {
-    sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
+  if (len <= 0) {
+    sendChunk(F("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.\n"));
+    sendChunk(F("[ota] Hint: ensure the URL is a direct .bin asset download, not HTML.\n"));
     http.end();
     server.client().flush();
     return;
   }
 
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream) {
+    sendChunk(F("[ota] ERROR: no HTTP stream\n"));
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+  int first = stream->peek(); // does not consume the byte
+  sendChunk(String("[ota] First byte (peek): 0x") + String((first < 0) ? 0 : first, HEX) + "\n");
+  server.client().flush();
+
+  // ESP32 app images typically start with 0xE9
+  if (first != 0xE9) {
+    sendChunk(F("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).\n"));
+    sendChunk(F("[ota] Usually this means you downloaded HTML or the wrong asset (e.g., littlefs.bin).\n"));
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+  // Force firmware update target explicitly (prevents confusion with filesystem updates)
+  if (!Update.begin((size_t)len, U_FLASH)) {
+    sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
+    Update.printError(Serial);
+    http.end();
+    server.client().flush();
+    return;
+  }
+
+// Optional: only if your server actually provides an MD5 header
+String md5 = http.header("x-MD5");  // or "Content-MD5"
+if (md5.length()) {
+  Update.setMD5(md5.c_str());
+}
+
+
   size_t written = Update.writeStream(*stream);
-  if (len > 0 && (int)written != len) {
+  sendChunk(String("[ota] Written: ") + String(written) + " bytes\n");
+  if ((int)written != len) {
     sendChunk(String("[ota] WARN: wrote ") + String(written) + " of " + String(len) + "\n");
   }
+  server.client().flush();
 
   if (!Update.end()) {
     sendChunk(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
+    Update.printError(Serial);
     http.end();
     server.client().flush();
     return;
@@ -1620,8 +1812,8 @@ void setup() {
   Serial.printf("[display] rotation=%d w=%d h=%d\n", display.getRotation(), display.width(), display.height());
 
   // FS mounting
-  fsOk = mountFS() && loadToc();
-  Serial.println(fsOk ? "[FS] Ready" : "[FS] Not ready");
+  fsOk = mountFS();
+  Serial.println(fsOk ? "[FS] Mounted" : "[FS] Mount failed");
 
   // Timezone
   applyTimezone(getPrefsTz(), !getPrefsOffline());
@@ -1665,6 +1857,37 @@ void loop() {
 #endif
     server.begin();
     Serial.println("[STA] Config server started on port 80");
+
+// Ensure verse content exists (download toc/entries/texts into LittleFS if missing).
+// Online only; in Offline mode we never attempt downloads.
+if (fsOk) {
+  bool offlineNow = getPrefsOffline();
+  if (!offlineNow) {
+    if (!contentOk) {
+      unsigned long nowMs = millis();
+      if (lastContentAttemptMs == 0 || (nowMs - lastContentAttemptMs) > 60UL * 1000UL) {
+        lastContentAttemptMs = nowMs;
+        contentOk = ensureVerseContentPresent();
+        // (Re)load TOC after ensuring content
+        if (contentOk) {
+          fsOk = loadToc();
+          contentOk = fsOk;
+        }
+        Serial.println(fsOk ? "[FS] Ready" : "[FS] Not ready");
+      }
+    }
+  } else {
+    // Offline mode: just try to load what is already on the device (once).
+    static bool offlineTried = false;
+    if (!offlineTried) {
+      offlineTried = true;
+      fsOk = loadToc();
+      contentOk = fsOk;
+      Serial.println(fsOk ? "[FS] Ready (offline)" : "[FS] Not ready (offline)");
+    }
+  }
+}
+
     serverStarted = true;
   }
 
