@@ -3,31 +3,14 @@ name: Build & Release (devices)
 on:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
   contents: write
 
-env:
-  # ---- Content repo (where toc.bin / entries.bin / texts.bin live)
-  CONTENT_OWNER: kingbutter
-  CONTENT_REPO: Verse-O-Clock-Content
-  CONTENT_BRANCH: main
-
-  # ---- ESP32 Arduino core index
-  ESP32_PACKAGE_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
-
-  # ---- Default device (used if devices/devices.json is missing)
-  DEFAULT_DEVICE_ID: xiao_esp32c3_7p5
-  DEFAULT_DEVICE_PATH: devices/xiao_esp32c3_7p5
-  # IMPORTANT: Adjust if your Arduino FQBN differs
-  DEFAULT_FQBN: esp32:esp32:XIAO_ESP32C3
-
 jobs:
   # ------------------------------------------------------------
-  # Build matrix from devices/devices.json (optional)
-  # If that file doesn't exist, fall back to DEFAULT_DEVICE_*
+  # Generate a device build matrix from devices.json
   # ------------------------------------------------------------
   matrix:
     runs-on: ubuntu-latest
@@ -37,62 +20,56 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build device matrix
+      - name: Build matrix from devices.json
         id: mk
         shell: bash
         run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
+          python - <<'PY'
           import json, os
           from pathlib import Path
 
-          default = [{
-            "device_id": os.environ["DEFAULT_DEVICE_ID"],
-            "device_path": os.environ["DEFAULT_DEVICE_PATH"],
-            "fqbn": os.environ["DEFAULT_FQBN"],
-          }]
+          cfg = json.loads(Path("devices.json").read_text(encoding="utf-8"))
+          include = []
 
-          cfg_path = Path("devices/devices.json")
-          if not cfg_path.exists():
-            print(f"devices/devices.json not found; using default: {default[0]['device_id']}")
-            include = default
-          else:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            include = []
-            for d in cfg.get("devices", []):
-              include.append({
-                "device_id": d["id"],
-                "device_path": d["path"],
-                "fqbn": d.get("fqbn", os.environ["DEFAULT_FQBN"]),
-              })
-            if not include:
-              include = default
+          for d in cfg.get("devices", []):
+            device_id = d["id"]
+            sketch = f"devices/{device_id}"
 
-          out = json.dumps(include)
-          print(out)
-          Path(os.environ["GITHUB_OUTPUT"]).write_text(f"include={out}\n", encoding="utf-8")
+            fqbn = d["board"]
+            ps = d.get("partition_scheme")
+            if ps:
+              fqbn = f"{fqbn}:PartitionScheme={ps}"
+
+            busy_patch = bool(d.get("display", {}).get("busy_polarity_patch", False))
+
+            include.append({
+              "id": device_id,
+              "sketch": sketch,
+              "fqbn": fqbn,
+              "busy_patch": busy_patch,
+            })
+
+          out = {"device": include}
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write("include=" + json.dumps(out) + "\n")
+
+          print(json.dumps(out, indent=2))
           PY
 
-  # ------------------------------------------------------------
-  # Build firmware + generate verse blobs (toc.bin/entries.bin/texts.bin)
-  # ------------------------------------------------------------
   build:
     needs: matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.matrix.outputs.include) }}
+      matrix: ${{ fromJson(needs.matrix.outputs.include) }}
 
     steps:
+      # ------------------------------------------------------------
+      # Checkout + toolchains
+      # ------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
@@ -102,10 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           arduino-cli config init
-          arduino-cli config set board_manager.additional_urls "${ESP32_PACKAGE_INDEX}"
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
+      # ------------------------------------------------------------
+      # Libraries
+      # ------------------------------------------------------------
       - name: Install Arduino libraries
         shell: bash
         run: |
@@ -117,167 +97,273 @@ jobs:
           arduino-cli lib install "WiFiManager"
           arduino-cli lib install "GxEPD2"
           arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "ArduinoJson"
           # Force Unishox from upstream GitHub repo
           arduino-cli lib install --git-url https://github.com/siara-cc/Unishox_Arduino_lib.git
 
-      - name: Install Python dependencies (helpers)
+      - name: Patch GxEPD2 BUSY polarity (device flag)
+        if: ${{ matrix.device.busy_patch }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --upgrade pip
-          pip install -r helpers/requirements.txt
+          echo "Patching GxEPD2 BUSY polarity for ${{ matrix.device.id }} (targeted to GxEPD2_750_T7)."
 
+          python - <<'PY'
+          from pathlib import Path
+          import re
 
-      - name: Generate verse content (toc/entries/texts)
+          lib_root = Path.home() / "Arduino" / "libraries" / "GxEPD2"
+          if not lib_root.exists():
+            raise SystemExit(f"GxEPD2 not found at {lib_root}")
+
+          # Find the one header that defines the driver class, and patch only that file.
+          candidates = []
+          for f in (lib_root / "src").rglob("*.h"):
+            try:
+              t = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+              continue
+            if "class GxEPD2_750_T7" in t:
+              candidates.append(f)
+
+          if len(candidates) != 1:
+            raise SystemExit("Expected exactly 1 driver file containing 'class GxEPD2_750_T7', found "
+                             f"{len(candidates)}: " + ", ".join(str(p) for p in candidates))
+
+          target = candidates[0]
+          text = target.read_text(encoding="utf-8", errors="ignore")
+
+          new = re.sub(r"(\bbusy_level\s*=\s*)LOW\b", r"\1HIGH", text)
+          new = re.sub(r"(\b_busy_level\s*=\s*)LOW\b", r"\1HIGH", new)
+
+          if new == text:
+            print(f"No changes needed in {target} (already patched or pattern not present).")
+          else:
+            target.write_text(new, encoding="utf-8")
+            print(f"Patched BUSY polarity in: {target}")
+          PY
+
+      # ------------------------------------------------------------
+      # Build verse data (Python → device data/)
+      # ------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build verse assets into device data/ (${{ matrix.device.id }})
+        shell: bash
+        working-directory: ${{ matrix.device.sketch }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install unishox2-py3
+          # helpers/ lives at repo root
+          python ../../helpers/build_verses_unishox.py
+
+      # ------------------------------------------------------------
+      # Compile firmware
+      # ------------------------------------------------------------
+      - name: Compile firmware (${{ matrix.device.id }})
         shell: bash
         run: |
           set -euo pipefail
-          # ---- Adjust this command to match how you run it locally ----
-          # Goal: produce toc.bin, entries.bin, texts.bin in the device data folder.
-          #
-          # Typical target folder:
-          #   ${{ matrix.device_path }}/data/
-          #
-          DATA_DIR="${{ matrix.device_path }}/data"
-          mkdir -p "${DATA_DIR}"
 
-          # If your helper already writes into the device data folder by default,
-          # you can keep it simple:
-          python3 helpers/build_verses_unishox.py
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            EXTRA_CPP_FLAGS="-DRELEASE_BUILD=1 -DFW_VERSION=\"${GITHUB_REF_NAME}\""
+          else
+            EXTRA_CPP_FLAGS=""
+          fi
 
-          # If your helper writes somewhere else, copy the outputs into DATA_DIR here.
+          arduino-cli compile \
+            --fqbn "${{ matrix.device.fqbn }}" \
+            --export-binaries \
+            --build-path "${{ matrix.device.sketch }}/build" \
+            --build-property "compiler.cpp.extra_flags=${EXTRA_CPP_FLAGS}" \
+            "${{ matrix.device.sketch }}"
 
-      - name: Build firmware (arduino-cli)
+
+      # ------------------------------------------------------------
+      # Build LittleFS image from data/ (IDE-like partitions.csv resolution)
+      # ------------------------------------------------------------
+      - name: Build LittleFS image (${{ matrix.device.id }})
         shell: bash
         run: |
           set -euo pipefail
-          # Find the ino file inside the device folder
-          INO="$(ls -1 "${{ matrix.device_path }}"/*.ino | head -n 1)"
-          if [ -z "${INO}" ]; then
-            echo "No .ino found under ${{ matrix.device_path }}"
+
+          SKETCH_DIR="${{ matrix.device.sketch }}"
+          FQBN="${{ matrix.device.fqbn }}"
+          DATA_DIR="$SKETCH_DIR/data"
+
+          # Resolve partitions.csv the same way Arduino IDE / ESP32 core does:
+          # - If sketch folder contains partitions.csv, that overrides the board's built-in scheme.
+          # - Otherwise, derive the built-in partitions CSV from arduino-cli --show-properties.
+          PART_CSV="$SKETCH_DIR/partitions.csv"
+
+          if [[ ! -f "$PART_CSV" ]]; then
+            PROPS="$(arduino-cli compile --fqbn "$FQBN" --show-properties --build-path "$SKETCH_DIR/build" "$SKETCH_DIR")"
+            RUNTIME_PLATFORM_PATH="$(printf "%s\n" "$PROPS" | awk -F= '$1=="runtime.platform.path"{print $2; exit}')"
+            BUILD_PARTITIONS="$(printf "%s\n" "$PROPS" | awk -F= '$1=="build.partitions"{print $2; exit}')"
+
+            if [[ -z "${RUNTIME_PLATFORM_PATH}" || -z "${BUILD_PARTITIONS}" ]]; then
+              echo "ERROR: Could not determine runtime.platform.path/build.partitions from --show-properties"
+              exit 1
+            fi
+
+            PART_CSV="$RUNTIME_PLATFORM_PATH/tools/partitions/${BUILD_PARTITIONS}.csv"
+            if [[ ! -f "$PART_CSV" ]]; then
+              echo "ERROR: Built-in partitions CSV not found: $PART_CSV"
+              exit 1
+            fi
+          fi
+
+          echo "Using partitions CSV: $PART_CSV"
+
+          LFS_OFF_HEX="$(awk -F',' '$1 ~ /^[[:space:]]*littlefs[[:space:]]*$/ {gsub(/[[:space:]]/,"",$4); print $4; exit}' "$PART_CSV")"
+          LFS_SIZE_HEX="$(awk -F',' '$1 ~ /^[[:space:]]*littlefs[[:space:]]*$/ {gsub(/[[:space:]]/,"",$5); print $5; exit}' "$PART_CSV")"
+
+          if [[ -z "$LFS_SIZE_HEX" ]]; then
+            echo "ERROR: littlefs partition not found in: $PART_CSV"
             exit 1
           fi
 
-          mkdir -p dist/${{ matrix.device_id }}
+          LFS_SIZE_BYTES=$((LFS_SIZE_HEX))
 
-          arduino-cli compile             --fqbn "${{ matrix.fqbn }}"             --output-dir "dist/${{ matrix.device_id }}/build"             "${INO}"
+          # Robustly get Arduino CLI data dir (JSON). Fallback to default location.
+          CORE_DATA="$(arduino-cli config dump --format json 2>/dev/null | python -c "import json,sys; print(json.load(sys.stdin).get('directories',{}).get('data',''))" || true)"
+          [[ -n "${CORE_DATA}" ]] || CORE_DATA="$HOME/.arduino15"
 
-          # Copy the compiled app bin(s) into dist
-          find "dist/${{ matrix.device_id }}/build" -maxdepth 1 -type f -name "*.bin" -exec cp -v {} "dist/${{ matrix.device_id }}/" \;
+          MKL="$(find "$CORE_DATA/packages/esp32/tools" -type f -name mklittlefs -print -quit 2>/dev/null || true)"
+          if [[ -z "${MKL}" ]]; then
+            echo "ERROR: mklittlefs not found under $CORE_DATA/packages/esp32/tools"
+            arduino-cli core list || true
+            exit 1
+          fi
 
-      - name: Create manifest.json (sizes + sha256)
+          mkdir -p dist
+          "$MKL" -c "$DATA_DIR" -s "$LFS_SIZE_BYTES" "dist/${{ matrix.device.id }}_littlefs.bin"
+          echo "$LFS_OFF_HEX" > "dist/${{ matrix.device.id }}_littlefs_offset.txt"
+
+      # ------------------------------------------------------------
+      # Collect firmware + devices.json
+      # ------------------------------------------------------------
+      - name: Collect artifacts
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+
+          SKETCH_DIR="${{ matrix.device.sketch }}"
+          DATA_DIR="$SKETCH_DIR/data"
+
+          # Pick the main firmware .bin from the build output (skip littlefs if present)
+          BIN_PATH="$(find "$SKETCH_DIR/build" -type f -name '*.bin' ! -name '*littlefs*' | head -n 1)"
+          test -f "$BIN_PATH"
+
+          mkdir -p dist
+          cp -v "$BIN_PATH" "dist/${{ matrix.device.id }}_firmware.bin"
+
+          # Always include the littlefs image built earlier
+          test -f "dist/${{ matrix.device.id }}_littlefs.bin"
+
+          # Copy content blobs produced by the helper into dist/
+          test -f "$DATA_DIR/toc.bin"
+          test -f "$DATA_DIR/entries.bin"
+          test -f "$DATA_DIR/texts.bin"
+          cp -v "$DATA_DIR/toc.bin"     "dist/${{ matrix.device.id }}_toc.bin"
+          cp -v "$DATA_DIR/entries.bin" "dist/${{ matrix.device.id }}_entries.bin"
+          cp -v "$DATA_DIR/texts.bin"   "dist/${{ matrix.device.id }}_texts.bin"
+
+          # Generate a content manifest (sizes + sha256)
+          python - <<'PY'
           import hashlib, json
           from pathlib import Path
 
-          data_dir = Path("${{ matrix.device_path }}/data")
-          files = ["toc.bin", "entries.bin", "texts.bin"]
-          manifest = {"device": "${{ matrix.device_id }}", "files": {}}
+          device = "${{ matrix.device.id }}"
+          dist = Path("dist")
 
-          for name in files:
-            p = data_dir / name
+          def sha256(p: Path) -> str:
+            h = hashlib.sha256()
+            with p.open("rb") as f:
+              for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            return h.hexdigest()
+
+          files = {
+            "toc.bin": dist / f"{device}_toc.bin",
+            "entries.bin": dist / f"{device}_entries.bin",
+            "texts.bin": dist / f"{device}_texts.bin",
+          }
+
+          manifest = {"device": device, "files": {}}
+          for name, p in files.items():
             if not p.exists():
-              raise SystemExit(f"Missing required content file: {p}")
-            b = p.read_bytes()
+              raise SystemExit(f"Missing {p}")
             manifest["files"][name] = {
-              "size": len(b),
-              "sha256": hashlib.sha256(b).hexdigest(),
+              "size": p.stat().st_size,
+              "sha256": sha256(p),
             }
 
-          out = data_dir / "manifest.json"
+          out = dist / f"{device}_content_manifest.json"
           out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
           print(f"Wrote {out}")
           PY
 
-      - name: Collect content artifacts
+          if [[ -f "devices.json" ]]; then
+            cp -v devices.json dist/devices.json
+          fi
+
+
+      # ------------------------------------------------------------
+      # Upload / Release
+      # ------------------------------------------------------------
+      - name: Upload artifacts (manual runs)
+        if: startsWith(github.ref, 'refs/tags/') != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.device.id }}
+          path: dist/*
+
+      - name: Resolve release title/body (from releases/<tag>.md)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_meta
         shell: bash
         run: |
           set -euo pipefail
-          DATA_DIR="${{ matrix.device_path }}/data"
-          mkdir -p "dist/${{ matrix.device_id }}/content"
-          cp -v "${DATA_DIR}/toc.bin" "dist/${{ matrix.device_id }}/content/"
-          cp -v "${DATA_DIR}/entries.bin" "dist/${{ matrix.device_id }}/content/"
-          cp -v "${DATA_DIR}/texts.bin" "dist/${{ matrix.device_id }}/content/"
-          cp -v "${DATA_DIR}/manifest.json" "dist/${{ matrix.device_id }}/content/"
+          NOTES="releases/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$NOTES" ]]; then
+            echo "ERROR: Release notes file not found: $NOTES"
+            exit 1
+          fi
+          RAW_TITLE="$(head -n 1 "$NOTES")"
+          TITLE="$(echo "$RAW_TITLE" | sed -E 's/^#+[[:space:]]*//; s/[[:space:]]+$//')"
+          if [[ -z "${TITLE}" ]]; then
+            echo "ERROR: First line of $NOTES is empty (used as release title)"
+            exit 1
+          fi
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "body_path=$NOTES" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-${{ matrix.device_id }}
-          path: dist/${{ matrix.device_id }}
-          if-no-files-found: error
-
-  # ------------------------------------------------------------
-  # Release (on tag): attach firmware artifacts to a GitHub Release
-  # ------------------------------------------------------------
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/**/*.bin
-            artifacts/**/content/*.bin
-            artifacts/**/content/manifest.json
-
-  # ------------------------------------------------------------
-  # Publish content to Verse-O-Clock-Content repo (on tag)
-  # Copies toc/entries/texts/manifest into the CONTENT repo root.
-  # ------------------------------------------------------------
-  publish_content:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Checkout content repo
+      - name: Publish content to Verse-O-Clock-Content (on tag)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.device.id == 'xiao_esp32c3_7p5'
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.CONTENT_OWNER }}/${{ env.CONTENT_REPO }}
-          ref: ${{ env.CONTENT_BRANCH }}
+          repository: kingbutter/Verse-O-Clock-Content
+          ref: main
           token: ${{ secrets.CONTENT_REPO_TOKEN }}
           path: contentrepo
 
-      - name: Copy content files into content repo
+      - name: Copy content into content repo + commit (on tag)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.device.id == 'xiao_esp32c3_7p5'
         shell: bash
         run: |
           set -euo pipefail
-          # For now, publish the DEFAULT_DEVICE_ID content (simple & safe).
-          # If you later have multiple devices, we can publish per-device folders.
-          SRC="artifacts/firmware-${DEFAULT_DEVICE_ID}/content"
-          if [ ! -d "${SRC}" ]; then
-            echo "Expected content at ${SRC}, but it doesn't exist."
-            echo "Artifacts tree:"
-            find artifacts -maxdepth 4 -type d -print
-            exit 1
-          fi
 
-          cp -v "${SRC}/toc.bin" contentrepo/
-          cp -v "${SRC}/entries.bin" contentrepo/
-          cp -v "${SRC}/texts.bin" contentrepo/
-          cp -v "${SRC}/manifest.json" contentrepo/
+          # Publish to repo root for now (single device).
+          cp -v "dist/${{ matrix.device.id }}_toc.bin"     "contentrepo/toc.bin"
+          cp -v "dist/${{ matrix.device.id }}_entries.bin" "contentrepo/entries.bin"
+          cp -v "dist/${{ matrix.device.id }}_texts.bin"   "contentrepo/texts.bin"
+          cp -v "dist/${{ matrix.device.id }}_content_manifest.json" "contentrepo/manifest.json"
 
-      - name: Commit & push
-        shell: bash
-        working-directory: contentrepo
-        run: |
-          set -euo pipefail
+          cd contentrepo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -289,3 +375,14 @@ jobs:
 
           git commit -m "Update Verse-O-Clock content for ${GITHUB_REF_NAME}"
           git push
+
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release_meta.outputs.title }}
+          body_path: ${{ steps.release_meta.outputs.body_path }}
+          files: dist/*
+          generate_release_notes: false
+          overwrite_files: true
