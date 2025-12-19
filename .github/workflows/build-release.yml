@@ -47,9 +47,9 @@ jobs:
               busy_patch = False
             else:
               busy_patch = str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
-            
-            driver_class = d.get("driver_class", "")
-
+            display = d.get("display", {}) or {}
+            busy_level = (display.get("busy_level", "HIGH") or "HIGH").strip().upper()
+            driver_class = display.get("driver_class", "")
             include.append({
               "id": device_id,
               "sketch": sketch,
@@ -114,84 +114,73 @@ jobs:
           # Force Unishox from upstream GitHub repo
           arduino-cli lib install --git-url https://github.com/siara-cc/Unishox_Arduino_lib.git
 
-      - name: Patch GxEPD2 BUSY polarity (device flag)
+      - name: Ensure GxEPD2 BUSY level (device flag)
         if: ${{ matrix.device.busy_patch }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Patching GxEPD2 BUSY polarity for ${{ matrix.device.id }} driver_class=${{ matrix.device.driver_class }}"
+          echo "Ensuring BUSY level for ${{ matrix.device.id }} driver=${{ matrix.device.driver_class }} busy_level=${{ matrix.device.busy_level }}"
 
           python - <<'PY'
           from pathlib import Path
-          import re, os
+          import os, re
 
           driver = "${{ matrix.device.driver_class }}".strip()
+          want  = "${{ matrix.device.busy_level }}".strip().upper()
+          if want not in ("HIGH", "LOW"):
+            raise SystemExit(f"ERROR: busy_level must be HIGH or LOW, got: {want}")
           if not driver:
-            raise SystemExit("ERROR: matrix.device.driver_class is empty. Set display.driver_class in devices.json.")
+            raise SystemExit("ERROR: driver_class is empty (set display.driver_class in devices.json)")
 
-          # Probe likely GxEPD2 locations (CI + local variants)
           home = Path(os.environ.get("HOME", str(Path.home())))
           sketch_dir = Path("${{ matrix.device.sketch }}")
 
           roots = [
-            Path.cwd() / "libraries" / "GxEPD2",           # repo-local
-            sketch_dir / "libraries" / "GxEPD2",           # sketch-local
-            home / "Arduino" / "libraries" / "GxEPD2",     # GitHub runner default
-            home / "Documents" / "Arduino" / "libraries" / "GxEPD2",  # some setups
+            Path.cwd() / "libraries" / "GxEPD2",
+            sketch_dir / "libraries" / "GxEPD2",
+            home / "Arduino" / "libraries" / "GxEPD2",
+            home / "Documents" / "Arduino" / "libraries" / "GxEPD2",
           ]
           roots = [r for r in roots if r.exists()]
-
           if not roots:
-            raise SystemExit(
-              "ERROR: GxEPD2 not found. Looked in:\n" +
-              "\n".join(str(r) for r in [
-                Path.cwd() / "libraries" / "GxEPD2",
-                sketch_dir / "libraries" / "GxEPD2",
-                home / "Arduino" / "libraries" / "GxEPD2",
-                home / "Documents" / "Arduino" / "libraries" / "GxEPD2",
-              ])
-            )
+            raise SystemExit("ERROR: GxEPD2 not found in expected locations.")
 
-          print("Found GxEPD2 roots:")
-          for r in roots:
-            print(" -", r)
-
-          needle = f"class {driver}"
-          matches = []
-
+          # Find driver implementation file
+          cpp = None
           for root in roots:
-            src = root / "src"
-            if not src.exists():
+            p = root / "src"
+            if not p.exists():
               continue
-            for f in src.rglob("*.h"):
-              t = f.read_text(encoding="utf-8", errors="ignore")
-              if needle in t:
-                matches.append(f)
+            cand = list(p.rglob(f"{driver}.cpp"))
+            if cand:
+              cpp = cand[0]
+              break
+          if not cpp:
+            raise SystemExit(f"ERROR: Could not find {driver}.cpp under any GxEPD2/src root.")
 
-          if len(matches) != 1:
-            raise SystemExit(
-              f"ERROR: Expected exactly 1 header containing '{needle}', found {len(matches)}:\n" +
-              "\n".join(str(p) for p in matches)
-            )
+          text = cpp.read_text(encoding="utf-8", errors="ignore")
 
-          target = matches[0]
-          text = target.read_text(encoding="utf-8", errors="ignore")
+          # Match: GxEPD2_EPD(cs, dc, rst, busy, <LEVEL>,
+          pat = r"(GxEPD2_EPD\(\s*cs\s*,\s*dc\s*,\s*rst\s*,\s*busy\s*,\s*)(HIGH|LOW)(\s*,)"
+          m = re.search(pat, text)
+          if not m:
+            raise SystemExit(f"ERROR: Couldn't find GxEPD2_EPD(... busy, <LEVEL>, ...) in {cpp}")
 
-          # Flip BUSY polarity: LOW -> HIGH (common fields used in GxEPD2 drivers)
-          new = re.sub(r"(\bbusy_level\s*=\s*)LOW\b", r"\1HIGH", text)
-          new = re.sub(r"(\b_busy_level\s*=\s*)LOW\b", r"\1HIGH", new)
+          have = m.group(2)
+          if have == want:
+            print(f"OK: {cpp} already has busy_level={want}")
+            print("[proof]", m.group(0))
+            raise SystemExit(0)
 
-          if new == text:
-            raise SystemExit(f"ERROR: No changes made in {target}. Already patched or pattern not present.")
+          new, n = re.subn(pat, r"\g<1>" + want + r"\3", text, count=1)
+          cpp.write_text(new, encoding="utf-8")
+          print(f"Patched {cpp}: {have} -> {want} (replacements={n})")
 
-          target.write_text(new, encoding="utf-8")
-          print(f"Patched BUSY polarity in: {target}")
-
-          # Proof output
-          for line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if ("busy_level" in line or "_busy_level" in line) and ("LOW" in line or "HIGH" in line):
-              print("[line]", line.strip())
+          m2 = re.search(pat, new)
+          if m2:
+            print("[proof]", m2.group(0))
           PY
+
 
 
       # ------------------------------------------------------------
