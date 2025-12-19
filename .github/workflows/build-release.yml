@@ -123,23 +123,38 @@ jobs:
 
           python - <<'PY'
           from pathlib import Path
-          import re, json, subprocess
+          import re, os
 
           driver = "${{ matrix.device.driver_class }}".strip()
           if not driver:
             raise SystemExit("ERROR: matrix.device.driver_class is empty. Set display.driver_class in devices.json.")
 
-          cfg = json.loads(subprocess.check_output(["arduino-cli","config","dump","--format","json"], text=True))
-          sketchbook = Path(cfg["directories"]["user"])
+          # Probe likely GxEPD2 locations (CI + local variants)
+          home = Path(os.environ.get("HOME", str(Path.home())))
+          sketch_dir = Path("${{ matrix.device.sketch }}")
 
           roots = [
-            Path.cwd() / "libraries" / "GxEPD2",
-            Path.cwd() / "${{ matrix.device.sketch }}" / "libraries" / "GxEPD2",
-            sketchbook / "libraries" / "GxEPD2",
+            Path.cwd() / "libraries" / "GxEPD2",           # repo-local
+            sketch_dir / "libraries" / "GxEPD2",           # sketch-local
+            home / "Arduino" / "libraries" / "GxEPD2",     # GitHub runner default
+            home / "Documents" / "Arduino" / "libraries" / "GxEPD2",  # some setups
           ]
           roots = [r for r in roots if r.exists()]
+
           if not roots:
-            raise SystemExit("ERROR: GxEPD2 not found in repo-local, sketch-local, or sketchbook libraries.")
+            raise SystemExit(
+              "ERROR: GxEPD2 not found. Looked in:\n" +
+              "\n".join(str(r) for r in [
+                Path.cwd() / "libraries" / "GxEPD2",
+                sketch_dir / "libraries" / "GxEPD2",
+                home / "Arduino" / "libraries" / "GxEPD2",
+                home / "Documents" / "Arduino" / "libraries" / "GxEPD2",
+              ])
+            )
+
+          print("Found GxEPD2 roots:")
+          for r in roots:
+            print(" -", r)
 
           needle = f"class {driver}"
           matches = []
@@ -162,7 +177,7 @@ jobs:
           target = matches[0]
           text = target.read_text(encoding="utf-8", errors="ignore")
 
-          # Flip busy polarity: LOW -> HIGH
+          # Flip BUSY polarity: LOW -> HIGH (common fields used in GxEPD2 drivers)
           new = re.sub(r"(\bbusy_level\s*=\s*)LOW\b", r"\1HIGH", text)
           new = re.sub(r"(\b_busy_level\s*=\s*)LOW\b", r"\1HIGH", new)
 
@@ -172,9 +187,9 @@ jobs:
           target.write_text(new, encoding="utf-8")
           print(f"Patched BUSY polarity in: {target}")
 
-          # Proof lines
+          # Proof output
           for line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if "busy_level" in line and ("LOW" in line or "HIGH" in line):
+            if ("busy_level" in line or "_busy_level" in line) and ("LOW" in line or "HIGH" in line):
               print("[line]", line.strip())
           PY
 
