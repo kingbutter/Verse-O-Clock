@@ -164,6 +164,7 @@ static char wm_unit[3]    = {0};
 static char wm_clk24[3]   = {0};  // "1" or "0"
 static char wm_glance[3]  = {0};  // "1" or "0"
 static char wm_offline[3] = {0};  // "1" or "0"
+static char wm_pwrmsg[3] = {0};  // "1" or "0" (show safe-to-unplug message)
 // datetime-local style string "YYYY-MM-DDThh:mm"
 static char wm_manualdt[22] = {0};
 
@@ -174,6 +175,7 @@ static WiFiManagerParameter* p_unit = nullptr;
 static WiFiManagerParameter* p_clk24 = nullptr;
 static WiFiManagerParameter* p_glance = nullptr;
 static WiFiManagerParameter* p_offline = nullptr;
+static WiFiManagerParameter* p_pwrmsg = nullptr;
 static WiFiManagerParameter* p_manualdt = nullptr;
 
 // Called when user hits "Save" on WiFiManager portal.
@@ -217,6 +219,7 @@ static String formatDate(const tm& t);
 static void forceLandscape();
 static void drawQRCode(int x, int y, int scale, const char* text);
 static void showSetupScreen();
+static void showPowerReadyScreen();
 static bool mountFS();
 
 // -----------------------
@@ -409,9 +412,30 @@ static bool getPrefsGlance() {
 }
 
 
+static bool getPrefsSetupDone() {
+  prefs.begin("voc", true);
+  bool v = prefs.getBool("setupDone", false);
+  prefs.end();
+  return v;
+}
+
+
+
 static bool getPrefsOffline() {
   prefs.begin("voc", true);
   bool v = prefs.getBool("offline", false); // default: online
+  prefs.end();
+  return v;
+}
+
+
+static bool getPrefsPwrMsg() {
+  // Default behavior:
+  // - First-time setup (setupDone==false): ON
+  // - After setup: whatever the user last saved (default OFF)
+  prefs.begin("voc", true);
+  bool setupDone = prefs.getBool("setupDone", false);
+  bool v = setupDone ? prefs.getBool("pwrmsg", false) : true;
   prefs.end();
   return v;
 }
@@ -555,9 +579,63 @@ static void showSetupScreen() {
     display.print(label);
 
     display.setFont(&FreeSans9pt7b);
-    display.setCursor(M, topY + qrSizePx + 55);
-    display.print("After saving settings, the clock will sync time and show verses.");
+    int infoY = topY + qrSizePx + 55;
+    display.setCursor(M, infoY);
+    display.print("After saving settings, you may unplug USB.");
+    display.setCursor(M, infoY + 18);
+    display.print("Battery: plug in or switch to ON.");
 
+  } while (display.nextPage());
+}
+
+// -----------------------
+// Power transition screen (after Save)
+// -----------------------
+static void showPowerReadyScreen() {
+  // After the user presses Save in the portal, update the ePaper with a friendly
+  // "safe to unplug / switch to battery" message. ePaper retains the image even
+  // when power is removed, which is perfect for battery installs.
+  const int W = display.width();
+  const int H = display.height();
+  const int M = 34;
+
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+
+    display.setFont(&FreeSans18pt7b);
+    const char* title = "SETTINGS SAVED";
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((W - (int)w) / 2, 70);
+    display.print(title);
+
+    display.setFont(&FreeSans12pt7b);
+    int y = 120;
+
+    display.setCursor(M, y);
+    display.print("You may safely unplug USB power.");
+    y += 32;
+
+    display.setCursor(M, y);
+    display.print("If using a battery, plug it in");
+    y += 28;
+    display.setCursor(M, y);
+    display.print("or move the battery switch to ON.");
+    y += 40;
+
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(M, y);
+    display.print("This message will remain on-screen");
+    y += 20;
+    display.setCursor(M, y);
+    display.print("even if power is removed.");
+
+    // Small footer
+    display.setCursor(M, H - 24);
+    display.print("Verse O' Clock");
   } while (display.nextPage());
 }
 
@@ -883,6 +961,7 @@ static void handleRoot() {
   String unit = getPrefsUnit();
   bool clock24 = getPrefsClock24();
   bool glance  = getPrefsGlance();
+  bool pwrmsg  = getPrefsPwrMsg();
 
   bool offline = getPrefsOffline();
   uint64_t mepoch = getPrefsManualEpoch();
@@ -1114,6 +1193,15 @@ static void handleRoot() {
   sendY(F("</div><div class='hint'>Glance mode shows a bigger clock + shorter verse snippet for across-the-room readability.</div>"));
 
 
+  // Power / battery reminder (optional)
+  sendY(F("<label style='display:flex;align-items:center;gap:10px;margin:10px 0 0 0;padding:10px;"
+          "border-radius:12px;border:1px solid var(--border);background:var(--card);'>"));
+  sendY(pwrmsg ? F("<input type='checkbox' id='pwrmsg' name='pwrmsg' value='1' checked>") :
+                 F("<input type='checkbox' id='pwrmsg' name='pwrmsg' value='1'>"));
+  sendY(F(" After Save, show a safe-to-unplug message on the ePaper</label>"));
+  sendY(F("<div class='hint'>Useful during first-time setup: after saving, the screen will say it is safe to unplug USB, and remind you to plug in the battery or switch it to <b>ON</b>.</div>"));
+
+
   // Offline mode + manual time
   sendY(F("<h2>Offline mode</h2>"));
   sendY(F("<div class='grid2'>"));
@@ -1141,7 +1229,7 @@ static void handleRoot() {
           "})();"
           "</script>"));
 
-  // Save
+// Save
   sendY(F("<div style='margin-top:16px; padding-bottom:32px;'>"
           "<button type='submit' class='savebtn'>Save</button>"
           "</div></form>"));
@@ -1177,6 +1265,7 @@ static void handleSave() {
 
   bool clock24 = server.hasArg("clk24");
   bool glance  = server.hasArg("glance");
+  bool pwrmsg  = server.hasArg("pwrmsg");
 
   bool offline = server.hasArg("offline"); // checkbox present => on
   String manualdt = server.hasArg("manualdt") ? server.arg("manualdt") : "";
@@ -1223,7 +1312,13 @@ static void handleSave() {
   prefs.putString("unit", unit);
   prefs.putBool("clk24", clock24);
   prefs.putBool("glance", glance);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
   prefs.putBool("offline", offline);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
 
   if (mepoch > 0) {
     prefs.putULong64("mepoch", mepoch);
@@ -1240,6 +1335,10 @@ static void handleSave() {
   applyTimezone(tz, !offline);
 
   lastWeatherFetchMs = 0;
+
+  // Optional: update ePaper with a safe-to-unplug/battery reminder.
+  // (ePaper retains this message even when power is removed.)
+  if (pwrmsg) showPowerReadyScreen();
 
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Saved");
@@ -1865,6 +1964,7 @@ static void initWiFiManagerCustomParams() {
   memset(wm_clk24,0,sizeof(wm_clk24));
   memset(wm_glance,0,sizeof(wm_glance));
   memset(wm_offline,0,sizeof(wm_offline));
+  memset(wm_pwrmsg,0,sizeof(wm_pwrmsg));
   memset(wm_manualdt,0,sizeof(wm_manualdt));
 
   if (hasLL) {
@@ -1876,12 +1976,13 @@ static void initWiFiManagerCustomParams() {
   strlcpy(wm_clk24,  clock24 ? "1" : "0", sizeof(wm_clk24));
   strlcpy(wm_glance, glance  ? "1" : "0", sizeof(wm_glance));
   strlcpy(wm_offline,offline ? "1" : "0", sizeof(wm_offline));
+  strlcpy(wm_pwrmsg, getPrefsPwrMsg() ? "1" : "0", sizeof(wm_pwrmsg));
   strlcpy(wm_manualdt, manualDT.c_str(), sizeof(wm_manualdt));
 
   // Free any existing params (defensive, in case portal is restarted)
   delete p_lat; delete p_lon; delete p_tz; delete p_unit;
-  delete p_clk24; delete p_glance; delete p_offline; delete p_manualdt;
-  p_lat = p_lon = p_tz = p_unit = p_clk24 = p_glance = p_offline = p_manualdt = nullptr;
+  delete p_clk24; delete p_glance; delete p_offline; delete p_pwrmsg; delete p_manualdt;
+  p_lat = p_lon = p_tz = p_unit = p_clk24 = p_glance = p_offline = p_pwrmsg = p_manualdt = nullptr;
 
   // Add a short note + fields. (WiFiManagerParameter supports "custom html" via the 1-arg ctor.)
   // Keep it simple: text inputs for tz/unit and 0/1 for toggles.
@@ -1892,6 +1993,7 @@ static void initWiFiManagerCustomParams() {
   p_clk24  = new WiFiManagerParameter("clk24",   "24-hour clock? (1 or 0)", wm_clk24, 2);
   p_glance = new WiFiManagerParameter("glance",  "Glance mode? (1 or 0)", wm_glance, 2);
   p_offline= new WiFiManagerParameter("offline", "Offline mode? (1 or 0)", wm_offline, 2);
+  p_pwrmsg = new WiFiManagerParameter("pwrmsg", "Show safe-to-unplug message after saving? (1 or 0)", wm_pwrmsg, 2);
   p_manualdt = new WiFiManagerParameter("manualdt", "Manual time (YYYY-MM-DDThh:mm, used when Offline=1)", wm_manualdt, 21);
 
   wm.addParameter(p_tz);
@@ -1901,6 +2003,7 @@ static void initWiFiManagerCustomParams() {
   wm.addParameter(p_clk24);
   wm.addParameter(p_glance);
   wm.addParameter(p_offline);
+  wm.addParameter(p_pwrmsg);
   wm.addParameter(p_manualdt);
 
   wm.setSaveConfigCallback(wmSaveCallback);
@@ -1929,6 +2032,7 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
   bool clock24 = p_clk24 ? (String(p_clk24->getValue()) == "1") : getPrefsClock24();
   bool glance  = p_glance ? (String(p_glance->getValue()) == "1") : getPrefsGlance();
   bool offline = p_offline ? (String(p_offline->getValue()) == "1") : getPrefsOffline();
+  bool pwrmsg  = p_pwrmsg ? (String(p_pwrmsg->getValue()) == "1") : getPrefsPwrMsg();
 
   String manualdt = p_manualdt ? String(p_manualdt->getValue()) : "";
   manualdt.trim();
@@ -1973,7 +2077,13 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
   prefs.putString("unit", unit);
   prefs.putBool("clk24", clock24);
   prefs.putBool("glance", glance);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
   prefs.putBool("offline", offline);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
+  prefs.putBool("pwrmsg", pwrmsg);
+  prefs.putBool("setupDone", true);
 
   if (mepoch > 0) {
     prefs.putULong64("mepoch", mepoch);
@@ -1992,6 +2102,10 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
 
   // Now apply TZ again, optionally enabling NTP if NOT offline
   applyTimezone(tz, !offline);
+
+  if (pwrmsg) {
+    showPowerReadyScreen();
+  }
 
   Serial.println("[wifi] saved custom params from WiFiManager portal");
 }
