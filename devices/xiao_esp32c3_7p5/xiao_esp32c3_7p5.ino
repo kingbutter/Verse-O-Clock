@@ -28,11 +28,11 @@
  ****************************************************/
 
 #include <Arduino.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include <SPI.h>
 #include <time.h>
 #include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Storage / preferences
 #include <LittleFS.h>
@@ -157,6 +157,24 @@ enum OtaState {
   OTA_ERROR
 };
 
+
+// ---------------- OTA background task support (mobile-safe) ----------------
+static TaskHandle_t gOtaTaskHandle = nullptr;
+
+static void otaSetMsg(const String& s) {
+  gOtaMsg = s;
+  Serial.println(String("[ota] ") + s);
+}
+
+static void runOtaApplyCore(); // forward
+
+static void otaTask(void* pv) {
+  (void)pv;
+  runOtaApplyCore();
+  gOtaTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+// --------------------------------------------------------------------------
 static volatile OtaState gOtaState = OTA_IDLE;
 static String gOtaMsg = "";
 static String gOtaErr = "";
@@ -1884,214 +1902,27 @@ static void handleOtaCheck() {
 }
 
 
-static void runOtaApplyCore() {
-#if !ENABLE_HTTP_OTA
-  gOtaState = OTA_ERROR;
-  gOtaErr = "OTA disabled";
-  gOtaMsg = "";
-  return;
-#else
-  if (WiFi.status() != WL_CONNECTED) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "WiFi not connected";
-    gOtaMsg = "";
-    return;
-  }
-
-  gOtaMsg = "Checking latest release...";
-  Serial.println("[ota] Checking latest release...");
-  Serial.printf("[ota] device=%s current=%s\n", DEVICE_ID, FW_VERSION);
-
-  String latestTag, assetUrl, err;
-  int assetSize = -1;
-
-  bool ok = otaGetLatestInfo(latestTag, assetUrl, assetSize, err);
-  if (!ok) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = err;
-    Serial.printf("[ota] ERROR: %s\n", err.c_str());
-    return;
-  }
-
-  Serial.printf("[ota] latest=%s\n", latestTag.c_str());
-  if (latestTag == String(FW_VERSION)) {
-    gOtaState = OTA_DONE;
-    gOtaMsg = "Up to date.";
-    Serial.println("[ota] Up to date.");
-    return;
-  }
-
-  gOtaMsg = String("Downloading ") + latestTag + "...";
-  Serial.printf("[ota] downloading: %s\n", assetUrl.c_str());
-  if (assetSize > 0) {
-    Serial.printf("[ota] declared size: %d bytes\n", assetSize);
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(20000);
-
-  if (!http.begin(client, assetUrl)) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = "http.begin failed";
-    Serial.println("[ota] ERROR: http.begin failed");
-    return;
-  }
-
-  int code = http.GET();
-
-  // Log basics
-  {
-    String ct = http.header("Content-Type");
-    int len0 = http.getSize();
-    Serial.printf("[ota] URL: %s\n", assetUrl.c_str());
-    Serial.printf("[ota] HTTP code: %d\n", code);
-    Serial.printf("[ota] Content-Length: %d\n", len0);
-    if (ct.length()) Serial.printf("[ota] Content-Type: %s\n", ct.c_str());
-  }
-
-  if (code != 200) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = String("HTTP error ") + String(code);
-    String body = http.getString();
-    if (body.length()) {
-      Serial.println("[ota] Body:");
-      Serial.println(body);
-    }
-    http.end();
-    return;
-  }
-
-  int len = http.getSize();
-  if (len <= 0) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = "No Content-Length (refusing OTA)";
-    Serial.println("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.");
-    http.end();
-    return;
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  if (!stream) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = "No HTTP stream";
-    Serial.println("[ota] ERROR: no HTTP stream");
-    http.end();
-    return;
-  }
-
-  int first = stream->peek(); // does not consume the byte
-  Serial.printf("[ota] First byte (peek): 0x%02X\n", (first < 0) ? 0 : first);
-
-  // ESP32 app images typically start with 0xE9
-  if (first != 0xE9) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = "Downloaded file does not look like ESP32 firmware (expected 0xE9)";
-    Serial.println("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).");
-    http.end();
-    return;
-  }
-
-  gOtaMsg = "Flashing firmware...";
-
-  // Force firmware update target explicitly (prevents confusion with filesystem updates)
-  if (!Update.begin((size_t)len, U_FLASH)) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = String("Update.begin failed: ") + Update.errorString();
-    Update.printError(Serial);
-    http.end();
-    return;
-  }
-
-  // Optional: only if your server provides an MD5 header
-  String md5 = http.header("x-MD5");  // or "Content-MD5"
-  if (md5.length()) {
-    Update.setMD5(md5.c_str());
-  }
-
-  size_t written = Update.writeStream(*stream);
-  Serial.printf("[ota] Written: %u bytes\n", (unsigned)written);
-  if ((int)written != len) {
-    Serial.printf("[ota] WARN: wrote %u of %d\n", (unsigned)written, len);
-  }
-
-  if (!Update.end()) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = String("Update.end failed: ") + Update.errorString();
-    Update.printError(Serial);
-    http.end();
-    return;
-  }
-
-  http.end();
-
-  if (!Update.isFinished()) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
-    gOtaMsg = "Update not finished";
-    Serial.println("[ota] ERROR: update not finished");
-    return;
-  }
-
-  gOtaState = OTA_DONE;
-  gOtaMsg = "Success. Rebooting...";
-  Serial.println("[ota] Success. Rebooting...");
-  delay(250);
-  ESP.restart();
-#endif
-}
-
-
-// ===== OTA apply runs in a background task (mobile browsers may drop the HTTP connection) =====
-static TaskHandle_t gOtaTaskHandle = nullptr;
-
-static void runOtaApplyCore();
-
-static void otaTask(void* pv) {
-  (void)pv;
-  runOtaApplyCore();
-  gOtaTaskHandle = nullptr;
-  vTaskDelete(nullptr);
-}
-
 static void handleOtaApply() {
 #if !ENABLE_HTTP_OTA
   server.send(400, "text/plain", "OTA is disabled in this build.");
   return;
 #else
-  Serial.println("[ota] handleOtaApply hit");
-  Serial.printf("[ota] method=%d uri=%s\n", server.method(), server.uri().c_str());
-
   if (WiFi.status() != WL_CONNECTED) {
-    server.send(400, "application/json", "{\"ok\":false,\"err\":\"WiFi not connected\"}");
+    server.send(400, "text/plain", "WiFi not connected. Connect to your WiFi first, then retry.");
     return;
   }
-
-  // Already running?
-  if (gOtaTaskHandle != nullptr || gOtaState == OTA_RUNNING) {
-    server.send(409, "application/json", "{\"ok\":false,\"err\":\"OTA already running\"}");
+  if (gOtaTaskHandle != nullptr) {
+    server.send(409, "application/json", "{\"ok\":false,\"msg\":\"OTA already running\"}");
     return;
   }
 
   gOtaState = OTA_RUNNING;
-  gOtaMsg   = "Starting OTA...";
-  gOtaErr   = "";
+  gOtaMsg = "Starting OTA...";
+  gOtaErr = "";
 
-  // Respond immediately so the browser (especially on mobile) can disconnect safely.
+  // Respond immediately so mobile browsers can sleep/lock without killing the OTA stream.
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"OTA started\"}");
 
-  // Start OTA in the background (core 0 is fine for ESP32-C3; pinned still works).
   xTaskCreatePinnedToCore(
     otaTask,
     "otaTask",
@@ -2101,6 +1932,161 @@ static void handleOtaApply() {
     &gOtaTaskHandle,
     0
   );
+#endif
+}
+
+
+static void runOtaApplyCore() {
+Serial.println("[ota] handleOtaApply hit");
+gOtaState = OTA_RUNNING;
+gOtaMsg = "Downloading and applying update...";
+gOtaErr = "";
+
+#if !ENABLE_HTTP_OTA
+return;
+#else
+  if (WiFi.status() != WL_CONNECTED) {
+return;
+  }
+sendChunk(F("[ota] Checking latest release...\n"));
+  sendChunk(String("[ota] device=") + DEVICE_ID + " current=" + FW_VERSION + "\n");
+String latestTag, assetUrl, err;
+  int assetSize = -1;
+
+  bool ok = otaGetLatestInfo(latestTag, assetUrl, assetSize, err);
+  if (!ok) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(String("[ota] ERROR: ") + err + "\n");
+return;
+  }
+
+  sendChunk(String("[ota] latest=") + latestTag + "\n");
+  if (latestTag == String(FW_VERSION)) {
+    sendChunk(F("[ota] Up to date.\n"));
+return;
+  }
+
+  sendChunk(String("[ota] downloading: ") + assetUrl + "\n");
+  if (assetSize > 0) {
+    sendChunk(String("[ota] declared size: ") + String(assetSize) + " bytes\n");
+  }
+WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+
+  if (!http.begin(client, assetUrl)) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(F("[ota] ERROR: http.begin failed\n"));
+return;
+  }
+
+  int code = http.GET();
+
+  // Log basics (Serial + web)
+  {
+    String ct = http.header("Content-Type");
+    int len0 = http.getSize();
+    Serial.printf("[ota] URL: %s\n", assetUrl.c_str());
+    Serial.printf("[ota] HTTP code: %d\n", code);
+    Serial.printf("[ota] Content-Length: %d\n", len0);
+    Serial.printf("[ota] Content-Type: %s\n", ct.c_str());
+
+    sendChunk(String("[ota] HTTP code: ") + code + "\n");
+    sendChunk(String("[ota] Content-Length: ") + len0 + "\n");
+    if (ct.length()) sendChunk(String("[ota] Content-Type: ") + ct + "\n");
+}
+
+  if (code != 200) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(String("[ota] ERROR: http ") + String(code) + "\n");
+    String body = http.getString();
+    if (body.length()) {
+      Serial.println(body + "\n");
+}
+    http.end();
+return;
+  }
+
+  int len = http.getSize();
+  if (len <= 0) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(F("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.\n"));
+    sendChunk(F("[ota] Hint: ensure the URL is a direct .bin asset download, not HTML.\n"));
+    http.end();
+return;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(F("[ota] ERROR: no HTTP stream\n"));
+    http.end();
+return;
+  }
+
+  int first = stream->peek(); // does not consume the byte
+  sendChunk(String("[ota] First byte (peek): 0x") + String((first < 0) ? 0 : first, HEX) + "\n");
+// ESP32 app images typically start with 0xE9
+  if (first != 0xE9) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(F("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).\n"));
+    sendChunk(F("[ota] Usually this means you downloaded HTML or the wrong asset (e.g., littlefs.bin).\n"));
+    http.end();
+return;
+  }
+
+  // Force firmware update target explicitly (prevents confusion with filesystem updates)
+  if (!Update.begin((size_t)len, U_FLASH)) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
+    Update.printError(Serial);
+    http.end();
+return;
+  }
+
+// Optional: only if your server actually provides an MD5 header
+String md5 = http.header("x-MD5");  // or "Content-MD5"
+if (md5.length()) {
+  Update.setMD5(md5.c_str());
+}
+
+
+  size_t written = Update.writeStream(*stream);
+  sendChunk(String("[ota] Written: ") + String(written) + " bytes\n");
+  if ((int)written != len) {
+    sendChunk(String("[ota] WARN: wrote ") + String(written) + " of " + String(len) + "\n");
+  }
+if (!Update.end()) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
+    Update.printError(Serial);
+    http.end();
+return;
+  }
+
+  http.end();
+
+  if (!Update.isFinished()) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
+    sendChunk(F("[ota] ERROR: update not finished\n"));
+return;
+  }
+
+  otaSetMsg("Success. Rebooting..."); gOtaState = OTA_SUCCESS;
+delay(250);
+  ESP.restart();
 #endif
 }
 
