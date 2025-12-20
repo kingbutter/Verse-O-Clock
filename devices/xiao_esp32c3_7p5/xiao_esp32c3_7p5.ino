@@ -147,6 +147,17 @@ Preferences prefs;
 WebServer server(80);
 WiFiManager wm;
 
+// ===== OTA status tracking =====
+enum OtaState {
+  OTA_IDLE,
+  OTA_RUNNING,
+  OTA_DONE,
+  OTA_ERROR
+};
+
+static volatile OtaState gOtaState = OTA_IDLE;
+static String gOtaMsg = "";
+static String gOtaErr = "";
 
 
 // -----------------------
@@ -196,6 +207,7 @@ uint32_t lastWeatherFetchMs = 0;
 float    weatherTempC = NAN;
 int      weatherCode  = -1;
 bool     weatherOk    = false;
+String   weatherErr   = "";
 
 bool setupScreenDrawn = false;
 
@@ -885,39 +897,21 @@ static String ianaToPosixTZ(const String& ianaIn) {
   return "UTC0";
 }
 
-static String gPosixTz = "";
-static bool   gWantSntp = false;
-static bool   gSntpStarted = false;
-
-// Apply timezone immediately (localtime/DST), but defer SNTP startup until WiFi is connected.
-// Starting SNTP too early can trigger lwIP core-lock assertions on some ESP32C3 builds.
 static void applyTimezone(const String& ianaTzIn, bool enableSntp) {
+  // Apply the selected timezone by setting TZ and calling tzset().
   String iana = normalizeIanaTz(ianaTzIn);
   String posix = ianaToPosixTZ(iana);
-
-  gPosixTz = posix;
-  gWantSntp = enableSntp;
-  gSntpStarted = false; // will be started later when WiFi is up
 
   setenv("TZ", posix.c_str(), 1);
   tzset();
 
-  Serial.printf("[tz] IANA=%s POSIX=%s sntp=%s (deferred)\n",
-                iana.c_str(), posix.c_str(), enableSntp ? "on" : "off");
+  if (enableSntp) {
+    // Most reliable on ESP32 for local time/DST behavior
+    configTzTime(posix.c_str(), "pool.ntp.org", "time.nist.gov");
+  }
+
+  Serial.printf("[tz] IANA=%s POSIX=%s sntp=%s\n", iana.c_str(), posix.c_str(), enableSntp ? "on" : "off");
 }
-
-static void startSntpIfNeeded() {
-  if (!gWantSntp || gSntpStarted) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!gPosixTz.length()) return;
-
-  // Most reliable on ESP32 for local time/DST behavior
-  configTzTime(gPosixTz.c_str(), "pool.ntp.org", "time.nist.gov");
-  gSntpStarted = true;
-
-  Serial.printf("[tz] SNTP started (TZ=%s)\n", gPosixTz.c_str());
-}
-
 
 // -----------------------
 // Weather
@@ -925,8 +919,15 @@ static void startSntpIfNeeded() {
 static bool fetchWeather() {
   // Fetch current weather from Open-Meteo (temperature + WMO weather_code).
   // Stores results in weatherTempC/weatherCode and sets weatherOk.
+  // On failure, sets weatherErr for better diagnostics / UI messaging.
+
+  weatherErr = "";
+
   float lat, lon;
-  if (!getPrefsLatLon(lat, lon)) return false;
+  if (!getPrefsLatLon(lat, lon)) {
+    weatherErr = "No lat/lon configured";
+    return false;
+  }
 
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
                "&longitude=" + String(lon, 4) +
@@ -936,26 +937,48 @@ static bool fetchWeather() {
   client.setInsecure();
 
   HTTPClient http;
-  if (!http.begin(client, url)) return false;
+  if (!http.begin(client, url)) {
+    weatherErr = "HTTP begin failed";
+    return false;
+  }
 
   int code = http.GET();
-  if (code != 200) { http.end(); return false; }
+  if (code != 200) {
+    weatherErr = String("HTTP ") + code;
+    http.end();
+    return false;
+  }
 
   String body = http.getString();
   http.end();
 
+  if (!body.length()) {
+    weatherErr = "Empty response";
+    return false;
+  }
+
   int cur = body.indexOf("\"current\":");
-  if (cur < 0) return false;
+  if (cur < 0) {
+    weatherErr = "Missing 'current' in response";
+    return false;
+  }
 
   float tempC;
   int wcode;
 
-  if (!parseNumberAfter(body, cur, "\"temperature_2m\":", tempC)) return false;
-  if (!parseIntAfter(body, cur, "\"weather_code\":", wcode)) return false;
+  if (!parseNumberAfter(body, cur, "\"temperature_2m\":", tempC)) {
+    weatherErr = "Parse temperature failed";
+    return false;
+  }
+  if (!parseIntAfter(body, cur, "\"weather_code\":", wcode)) {
+    weatherErr = "Parse weather_code failed";
+    return false;
+  }
 
   weatherTempC = tempC;
   weatherCode  = wcode;
   weatherOk    = true;
+  weatherErr   = "";
   return true;
 }
 
@@ -1088,13 +1111,64 @@ static void handleRoot() {
           "function otaApply(){"
           "  const st=document.getElementById('otaStatus');"
           "  const pill=document.getElementById('otaPill');"
-          "  if(st) st.textContent='Applying update...';"
-          "  if(pill) pill.textContent='OTA: updating';"
-          "  fetch('/ota_apply').then(r=>r.text()).then(t=>{"
-          "    const pre=document.getElementById('otaLog');"
-          "    if(pre){ pre.textContent=t; pre.style.display='block'; }"
-          "    if(pill) pill.textContent='OTA: done';"
-          "  }).catch(e=>{ if(st) st.textContent='Apply failed: ' + e; if(pill) pill.textContent='OTA: error'; });"
+          "  const pre=document.getElementById('otaLog');"
+
+          "  if(st) st.textContent='Starting update...';"
+          "  if(pill) pill.textContent='OTA: starting';"
+          "  if(pre){"
+          "    pre.textContent="
+          "      'Starting update...\\n'"
+          "    + 'You may lock your phone.\\n'"
+          "    + 'The device will reboot when finished.\\n';"
+          "    pre.style.display='block';"
+          "  }"
+
+          "  try{"
+          "    if(navigator.sendBeacon){"
+          "      navigator.sendBeacon('/ota_apply','');"
+          "    } else {"
+          "      fetch('/ota_apply',{method:'POST',cache:'no-store'}).catch(function(){});"
+          "    }"
+          "  }catch(e){}"
+
+          "  if(window.__otaTimer) clearInterval(window.__otaTimer);"
+          "  window.__otaTimer=setInterval(pollOtaStatus,1200);"
+          "}"
+
+          "function pollOtaStatus(){"
+          "  const st=document.getElementById('otaStatus');"
+          "  const pill=document.getElementById('otaPill');"
+          "  const pre=document.getElementById('otaLog');"
+
+          "  fetch('/ota_status',{cache:'no-store'})"
+          "    .then(function(r){return r.json();})"
+          "    .then(function(j){"
+          "      if(!j||!j.state) return;"
+
+          "      if(pill) pill.textContent='OTA: '+j.state;"
+
+          "      if(j.state==='idle'){"
+          "        if(st) st.textContent='Up to date ('+(j.fw||'')+')';"
+          "        if(pre) pre.textContent='Update complete.';"
+          "        clearInterval(window.__otaTimer);"
+          "      } else if(j.state==='error'){"
+          "        if(st) st.textContent='Update failed';"
+          "        if(pre) pre.textContent='Error: '+(j.err||'unknown');"
+          "        clearInterval(window.__otaTimer);"
+          "      } else {"
+          "        if(st) st.textContent='Updating...';"
+          "        if(j.msg && pre) pre.textContent=j.msg;"
+          "      }"
+          "    })"
+          "    .catch(function(){"
+          "      if(pill) pill.textContent='OTA: reconnecting';"
+          "      if(st) st.textContent='Reconnecting...';"
+          "      if(pre){"
+          "        pre.textContent="
+          "          'Reconnecting...\\n'"
+          "        + 'This is normal while the device reboots.';"
+          "      }"
+          "    });"
           "}"
 
           "</script>"));
@@ -1782,6 +1856,11 @@ static void handleOtaCheck() {
 }
 
 static void handleOtaApply() {
+
+gOtaState = OTA_RUNNING;
+gOtaMsg = "Downloading and applying update...";
+gOtaErr = "";
+
 #if !ENABLE_HTTP_OTA
   server.send(400, "text/plain", "OTA is disabled in this build.");
   return;
@@ -1803,6 +1882,8 @@ static void handleOtaApply() {
 
   bool ok = otaGetLatestInfo(latestTag, assetUrl, assetSize, err);
   if (!ok) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(String("[ota] ERROR: ") + err + "\n");
     server.client().flush();
     return;
@@ -1829,6 +1910,8 @@ static void handleOtaApply() {
   http.setTimeout(20000);
 
   if (!http.begin(client, assetUrl)) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(F("[ota] ERROR: http.begin failed\n"));
     server.client().flush();
     return;
@@ -1852,6 +1935,8 @@ static void handleOtaApply() {
   }
 
   if (code != 200) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(String("[ota] ERROR: http ") + String(code) + "\n");
     String body = http.getString();
     if (body.length()) {
@@ -1864,6 +1949,8 @@ static void handleOtaApply() {
 
   int len = http.getSize();
   if (len <= 0) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(F("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.\n"));
     sendChunk(F("[ota] Hint: ensure the URL is a direct .bin asset download, not HTML.\n"));
     http.end();
@@ -1873,6 +1960,8 @@ static void handleOtaApply() {
 
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(F("[ota] ERROR: no HTTP stream\n"));
     http.end();
     server.client().flush();
@@ -1885,6 +1974,8 @@ static void handleOtaApply() {
 
   // ESP32 app images typically start with 0xE9
   if (first != 0xE9) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(F("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).\n"));
     sendChunk(F("[ota] Usually this means you downloaded HTML or the wrong asset (e.g., littlefs.bin).\n"));
     http.end();
@@ -1894,6 +1985,8 @@ static void handleOtaApply() {
 
   // Force firmware update target explicitly (prevents confusion with filesystem updates)
   if (!Update.begin((size_t)len, U_FLASH)) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
     Update.printError(Serial);
     http.end();
@@ -1916,6 +2009,8 @@ if (md5.length()) {
   server.client().flush();
 
   if (!Update.end()) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
     Update.printError(Serial);
     http.end();
@@ -1926,6 +2021,8 @@ if (md5.length()) {
   http.end();
 
   if (!Update.isFinished()) {
+    gOtaState = OTA_ERROR;
+    gOtaErr = "OTA failed";
     sendChunk(F("[ota] ERROR: update not finished\n"));
     server.client().flush();
     return;
@@ -1934,15 +2031,15 @@ if (md5.length()) {
   sendChunk(F("[ota] Success. Rebooting...\n"));
   server.client().flush();
   delay(250);
-  // Close the HTTP response cleanly so the browser fetch resolves before we reboot.
-  server.client().stop();
-  delay(750);
   ESP.restart();
 #endif
 }
 
 // Back-compat: keep /ota endpoint as "apply update"
 static void handleOta() {
+  gOtaState = OTA_DONE;
+  gOtaMsg = "Update complete. Rebooting...";
+  delay(300);
   handleOtaApply();
 }
 
@@ -2147,6 +2244,42 @@ static void startWiFiManagerPortal(bool wipeWifi) {
   wm.startConfigPortal(SETUP_AP_SSID);
 }
 
+static String jsonEscape(const String& s) {
+  String o;
+  o.reserve(s.length());
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\\') o += "\\\\";
+    else if (c == '"') o += "\\\"";
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "\\r";
+    else o += c;
+  }
+  return o;
+}
+
+static void handleOtaStatus() {
+  String state;
+  switch (gOtaState) {
+    case OTA_IDLE:    state = "idle"; break;
+    case OTA_RUNNING: state = "running"; break;
+    case OTA_DONE:    state = "idle"; break;   // treat done as idle
+    case OTA_ERROR:   state = "error"; break;
+    default:          state = "unknown"; break;
+  }
+
+  String json = "{";
+  json += "\"state\":\"" + state + "\"";
+  json += ",\"fw\":\"" + String(FW_VERSION) + "\"";
+  json += ",\"msg\":\"" + jsonEscape(gOtaMsg) + "\"";
+  json += ",\"err\":\"" + jsonEscape(gOtaErr) + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+
+
 void setup() {
   Serial.begin(115200);
   delay(100);
@@ -2178,7 +2311,6 @@ void setup() {
   if (ok) {
     Serial.print("[wifi] connected, IP=");
     Serial.println(WiFi.localIP());
-    startSntpIfNeeded();
   } else {
     Serial.println("[wifi] no saved wifi, portal started");
   }
@@ -2219,6 +2351,7 @@ void loop() {
     server.on("/ota_check", HTTP_GET, handleOtaCheck);
     server.on("/ota_apply", HTTP_GET, handleOtaApply);
     server.on("/ota", HTTP_GET, handleOta); // back-compat
+    server.on("/ota_status", HTTP_GET, handleOtaStatus);
 #endif
     server.begin();
     Serial.println("[STA] Config server started on port 80");
@@ -2263,7 +2396,7 @@ if (fsOk) {
         Serial.printf("[WX] temp=%.1fC code=%d", weatherTempC, weatherCode);
       } else {
         weatherOk = false;
-        Serial.println("[WX] fetch failed (set lat/lon in config page)");
+        Serial.print("[WX] fetch failed: "); Serial.println(weatherErr.length() ? weatherErr : "unknown");
       }
       lastWeatherFetchMs = millis();
     }
