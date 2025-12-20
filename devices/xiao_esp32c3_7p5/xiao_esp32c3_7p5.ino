@@ -1135,6 +1135,8 @@ static void handleRoot() {
           "  window.__otaTimer=setInterval(pollOtaStatus,1200);"
           "}"
 
+          "window.__otaSawRunning=false;"
+
           "function pollOtaStatus(){"
           "  const st=document.getElementById('otaStatus');"
           "  const pill=document.getElementById('otaPill');"
@@ -1147,18 +1149,41 @@ static void handleRoot() {
 
           "      if(pill) pill.textContent='OTA: '+j.state;"
 
+          "      if(j.state==='running'){"
+          "        window.__otaSawRunning=true;"
+          "        if(st) st.textContent='Updating...';"
+          "        if(j.msg && pre) pre.textContent=j.msg;"
+          "        return;"
+          "      }"
+
           "      if(j.state==='idle'){"
+          "        if(!window.__otaSawRunning){"
+          "          // OTA hasn't actually started (or /ota_apply never reached the device)."
+          "          if(st) st.textContent='Waiting for OTA to start...';"
+          "          if(pre){"
+          "            pre.textContent="
+          "              'Waiting for OTA to start...\\n'"
+          "            + 'If this never changes, /ota_apply may not be reachable (POST route).';"
+          "          }"
+          "          return;"
+          "        }"
+          "        // Only after we have seen 'running' do we treat 'idle' as completion."
           "        if(st) st.textContent='Up to date ('+(j.fw||'')+')';"
           "        if(pre) pre.textContent='Update complete.';"
           "        clearInterval(window.__otaTimer);"
-          "      } else if(j.state==='error'){"
+          "        return;"
+          "      }"
+
+          "      if(j.state==='error'){"
           "        if(st) st.textContent='Update failed';"
           "        if(pre) pre.textContent='Error: '+(j.err||'unknown');"
           "        clearInterval(window.__otaTimer);"
-          "      } else {"
-          "        if(st) st.textContent='Updating...';"
-          "        if(j.msg && pre) pre.textContent=j.msg;"
+          "        return;"
           "      }"
+
+          "      // Any other state: keep showing status text"
+          "      if(st) st.textContent='Updating...';"
+          "      if(j.msg && pre) pre.textContent=j.msg;"
           "    })"
           "    .catch(function(){"
           "      if(pill) pill.textContent='OTA: reconnecting';"
@@ -1170,6 +1195,7 @@ static void handleRoot() {
           "      }"
           "    });"
           "}"
+
 
           "</script>"));
 
@@ -1857,6 +1883,9 @@ static void handleOtaCheck() {
 
 static void handleOtaApply() {
 
+Serial.println("[ota] handleOtaApply hit");
+Serial.printf("[ota] method=%d uri=%s\n", server.method(), server.uri().c_str());
+
 gOtaState = OTA_RUNNING;
 gOtaMsg = "Downloading and applying update...";
 gOtaErr = "";
@@ -2348,6 +2377,7 @@ void loop() {
       startWiFiManagerPortal(true);
     });
 #if ENABLE_HTTP_OTA
+    server.on("/ota_apply", HTTP_POST, handleOtaApply);
     server.on("/ota_check", HTTP_GET, handleOtaCheck);
     server.on("/ota_apply", HTTP_GET, handleOtaApply);
     server.on("/ota", HTTP_GET, handleOta); // back-compat
