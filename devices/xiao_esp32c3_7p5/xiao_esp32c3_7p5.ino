@@ -147,8 +147,22 @@ Preferences prefs;
 WebServer server(80);
 WiFiManager wm;
 
+// -----------------------------------------------------------------------------
+// Boot / portal status messaging on ePaper
+// -----------------------------------------------------------------------------
+// These are used to show the user what's happening during boot, and why the
+// device might be in setup portal mode (e.g., first boot vs. saved WiFi failed).
+static bool gHadWifiSinceBoot = false; // once true, never show setup portal automatically on disconnect
+static String gPortalReason1;
+static String gPortalReason2;
+static bool   gBootScreenShown = false;
 
 
+
+
+// Power-off screen is shown only when explicitly requested via the "pwrmsg" checkbox.
+static bool     gShowPowerOffScreen = false;
+static uint32_t gPowerOffScreenUntilMs = 0;
 // -----------------------
 // WiFiManager custom params (so first-run setup can configure everything
 // without needing to connect again after WiFi is saved)
@@ -366,6 +380,52 @@ static const char* BOOKS[66] = {
   "1 John","2 John","3 John","Jude","Revelation"
 };
 
+// Draw a small Wi-Fi indicator (3 bars). If disconnected, draws a slash through it.
+static void drawWifiIcon(int x, int y, bool connected) {
+  // x,y = top-left of icon box
+  const int w = 18;
+  const int h = 14;
+  // Determine level based on RSSI (only meaningful when connected)
+  int lvl = 0; // 0..3
+  if (connected) {
+    int rssi = WiFi.RSSI();
+    if (rssi > -60) lvl = 3;
+    else if (rssi > -70) lvl = 2;
+    else if (rssi > -80) lvl = 1;
+    else lvl = 0;
+  }
+
+  // baseline
+  int baseY = y + h;
+  // bar widths/spacings
+  int bw = 3;
+  int gap = 2;
+
+  for (int i = 0; i < 3; i++) {
+    int bh = (i + 1) * 4; // 4,8,12
+    int bx = x + i * (bw + gap);
+    int by = baseY - bh;
+    if (connected && (i < lvl)) {
+      display.fillRect(bx, by, bw, bh, GxEPD_BLACK);
+    } else {
+      display.drawRect(bx, by, bw, bh, GxEPD_BLACK);
+    }
+  }
+
+  // Optional dot at left
+  if (connected && lvl > 0) {
+    display.fillCircle(x + 13, baseY - 1, 1, GxEPD_BLACK);
+  } else {
+    display.drawCircle(x + 13, baseY - 1, 1, GxEPD_BLACK);
+  }
+
+  if (!connected) {
+    // slash
+    display.drawLine(x - 1, y + 1, x + w, y + h - 1, GxEPD_BLACK);
+  }
+}
+;
+
 static String bookName(uint16_t id) {
   if (id >= 1 && id <= 66) return BOOKS[id - 1];
   return "Unknown";
@@ -431,11 +491,11 @@ static bool getPrefsOffline() {
 
 static bool getPrefsPwrMsg() {
   // Default behavior:
-  // - First-time setup (setupDone==false): ON
+  // - First-time setup (setupDone==false): OFF
   // - After setup: whatever the user last saved (default OFF)
   prefs.begin("voc", true);
   bool setupDone = prefs.getBool("setupDone", false);
-  bool v = setupDone ? prefs.getBool("pwrmsg", false) : true;
+  bool v = setupDone ? prefs.getBool("pwrmsg", false) : false;
   prefs.end();
   return v;
 }
@@ -452,6 +512,30 @@ static uint32_t getPrefsManualSetMs() {
   uint32_t v = prefs.getULong("msetms", 0); 
   prefs.end(); 
   return v; 
+}
+
+// True once we've successfully connected to WiFi at least once.
+// This lets us distinguish "first boot / no credentials" from
+// "saved WiFi but couldn't connect" when showing the setup portal.
+static bool getPrefsWifiEver() {
+  prefs.begin("voc", true);
+  bool v = prefs.getBool("wifiEver", false);
+  prefs.end();
+  return v;
+}
+
+static String getPrefsLastSsid() {
+  prefs.begin("voc", true);
+  String v = prefs.getString("lastSsid", "");
+  prefs.end();
+  return v;
+}
+
+static void setPrefsWifiEverAndSsid(const String& ssid) {
+  prefs.begin("voc", false);
+  prefs.putBool("wifiEver", true);
+  if (ssid.length()) prefs.putString("lastSsid", ssid);
+  prefs.end();
 }
 
 
@@ -536,7 +620,37 @@ static void drawQRCode(int x, int y, int scale, const char* text) {
 // -----------------------
 // Setup screen (AP mode)
 // -----------------------
-static void showSetupScreen() {
+static void showBootScreen(const String& l1, const String& l2) {
+  // Lightweight "I'm alive" screen during boot.
+  // ePaper updates are slow; keep it minimal.
+  const int W = display.width();
+  const int H = display.height();
+  const int M = 34;
+
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    display.setFont(&FreeSans18pt7b);
+
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(l1.c_str(), 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((W - (int)w) / 2, 78);
+    display.print(l1);
+
+    display.setFont(&FreeSans12pt7b);
+    display.getTextBounds(l2.c_str(), 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((W - (int)w) / 2, 125);
+    display.print(l2);
+
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(M, H - 40);
+    display.print("If setup portal appears, scan the QR.");
+  } while (display.nextPage());
+}
+
+static void showSetupScreen(const String& reason1, const String& reason2) {
   // Draw the initial setup screen shown while the device is in AP/portal mode.
   // Includes a QR code for quickly opening the captive portal.
   const int W = display.width();
@@ -553,23 +667,39 @@ static void showSetupScreen() {
     display.print("Welcome to Verse O' Clock");
 
     display.setFont(&FreeSans9pt7b);
-    display.setCursor(M, 85);
+    display.setCursor(M, 78);
     display.print("1) Connect to Wi-Fi: ");
     display.print(SETUP_AP_SSID);
 
-    display.setCursor(M, 110);
+    display.setCursor(M, 102);
     display.print("2) Open the portal: http://192.168.4.1");
+
+    // Reason line(s) so the user knows why they're seeing this.
+    if (reason1.length()) {
+      display.setCursor(M, 126);
+      display.print(reason1);
+      if (reason2.length()) {
+        display.setCursor(M, 146);
+        display.print(reason2);
+      }
+    }
 
     const int qrScale = 5;
     const int qrVersion = 4;
     const int qrSizePx = (21 + (qrVersion - 1) * 4) * qrScale;
 
     int leftX  = M;
-    int topY   = 145;
+    int topY   = reason1.length() ? 170 : 145;
 
+    // QR 1: Open captive portal
     drawQRCode(leftX, topY, qrScale, "http://192.168.4.1");
 
-    display.setFont(&FreeSans12pt7b);
+    // QR 2: Join the setup Wi‑Fi (mobile-friendly)
+    // iOS/Android camera will usually offer a "Join network" prompt for this format.
+    const String wifiQr = String("WIFI:T:nopass;S:") + String(SETUP_AP_SSID) + ";;";
+    int rightX = W - M - qrSizePx;
+    drawQRCode(rightX, topY, qrScale, wifiQr.c_str());
+display.setFont(&FreeSans12pt7b);
     const char* label = "Open Setup Portal";
     int16_t x1, y1;
     uint16_t w, h;
@@ -578,7 +708,13 @@ static void showSetupScreen() {
     display.setCursor(labelX, topY + qrSizePx + 28);
     display.print(label);
 
-    display.setFont(&FreeSans9pt7b);
+    // Label for the Wi‑Fi QR (right)
+    const char* label2 = "Join Setup Wi-Fi";
+    display.getTextBounds(label2, 0, 0, &x1, &y1, &w, &h);
+    int label2X = rightX + (qrSizePx - (int)w) / 2;
+    display.setCursor(label2X, topY + qrSizePx + 28);
+    display.print(label2);
+display.setFont(&FreeSans9pt7b);
     int infoY = topY + qrSizePx + 55;
     display.setCursor(M, infoY);
     display.print("After saving settings, you may unplug USB.");
@@ -1312,13 +1448,9 @@ static void handleSave() {
   prefs.putString("unit", unit);
   prefs.putBool("clk24", clock24);
   prefs.putBool("glance", glance);
-  prefs.putBool("pwrmsg", pwrmsg);
   prefs.putBool("setupDone", true);
   prefs.putBool("offline", offline);
   prefs.putBool("pwrmsg", pwrmsg);
-  prefs.putBool("setupDone", true);
-  prefs.putBool("pwrmsg", pwrmsg);
-  prefs.putBool("setupDone", true);
 
   if (mepoch > 0) {
     prefs.putULong64("mepoch", mepoch);
@@ -1336,12 +1468,23 @@ static void handleSave() {
 
   lastWeatherFetchMs = 0;
 
-  // Optional: update ePaper with a safe-to-unplug/battery reminder.
-  // (ePaper retains this message even when power is removed.)
-  if (pwrmsg) showPowerReadyScreen();
+  // If the user explicitly requested the "safe to power off" screen, show it now.
+  // Otherwise, keep whatever screen we were on; the normal loop will refresh shortly.
+  if (pwrmsg) {
+    gShowPowerOffScreen = true;
+    gPowerOffScreenUntilMs = millis() + 15000UL; // show for ~15s
+  } else {
+    gShowPowerOffScreen = false;
+    gPowerOffScreenUntilMs = 0;
+  }
 
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Saved");
+
+  // Draw after responding so the browser redirect isn't delayed.
+  if (pwrmsg) {
+    showPowerReadyScreen();
+  }
 }
 
 
@@ -1554,8 +1697,17 @@ display.setFont(&FreeSans9pt7b);
 display.setCursor(M, footerY1);
 display.print(dateStr);
 
+
+
+// Wi-Fi indicator (far right). Shows bars when connected, slashed icon when disconnected.
+bool wifiUp = (WiFi.status() == WL_CONNECTED);
+int wifiIconW = 20;
+int wifiX = (W - M) - wifiIconW;
+int wifiY = footerY1 - 14;
+drawWifiIcon(wifiX, wifiY, wifiUp);
+
 // Right: weather
-int rightX = W - M;
+int rightX = W - M - 24; // leave room for Wi-Fi icon
 if (showWx) {
   int txw = textWidth(tempStr);
   int iconW = 28;
@@ -2077,11 +2229,7 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
   prefs.putString("unit", unit);
   prefs.putBool("clk24", clock24);
   prefs.putBool("glance", glance);
-  prefs.putBool("pwrmsg", pwrmsg);
-  prefs.putBool("setupDone", true);
   prefs.putBool("offline", offline);
-  prefs.putBool("pwrmsg", pwrmsg);
-  prefs.putBool("setupDone", true);
   prefs.putBool("pwrmsg", pwrmsg);
   prefs.putBool("setupDone", true);
 
@@ -2103,10 +2251,6 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
   // Now apply TZ again, optionally enabling NTP if NOT offline
   applyTimezone(tz, !offline);
 
-  if (pwrmsg) {
-    showPowerReadyScreen();
-  }
-
   Serial.println("[wifi] saved custom params from WiFiManager portal");
 }
 
@@ -2115,9 +2259,16 @@ static void startWiFiManagerPortal(bool wipeWifi) {
   if (wipeWifi) {
     Serial.println("[wifi] wiping WiFi credentials and starting portal");
     wm.resetSettings();
+    gPortalReason1 = "Setup portal: Wi-Fi reset requested.";
+    gPortalReason2 = "Choose Wi-Fi and save settings.";
   } else {
     Serial.println("[wifi] starting portal");
+    gPortalReason1 = "Setup portal: update Wi-Fi/settings.";
+    gPortalReason2 = "Choose Wi-Fi and save settings.";
   }
+
+  // Force a redraw of the setup screen next loop.
+  setupScreenDrawn = false;
 
   initWiFiManagerCustomParams();
 
@@ -2141,6 +2292,12 @@ void setup() {
   forceLandscape();
   Serial.printf("[display] rotation=%d w=%d h=%d\n", display.getRotation(), display.width(), display.height());
 
+  // Show a simple boot status so the screen doesn't look "dead".
+  if (!gBootScreenShown) {
+    gBootScreenShown = true;
+    showBootScreen("Verse O' Clock", "Booting...");
+  }
+
   // FS mounting
   fsOk = mountFS();
   Serial.println(fsOk ? "[FS] Mounted" : "[FS] Mount failed");
@@ -2150,31 +2307,98 @@ void setup() {
 
   // WiFiManager (non-blocking)
   initWiFiManagerCustomParams();
-
   wm.setConfigPortalBlocking(false);
 
+  // "Historical" info (useful fallback for UI), but NOT proof that creds exist right now.
+  bool wifiEver  = getPrefsWifiEver();
+  String lastSsid = getPrefsLastSsid();
+  lastSsid.trim();
+
+  // Boot/status message before we try
+  if (wifiEver && lastSsid.length()) {
+    showBootScreen("Verse O' Clock", String("Connecting: ") + lastSsid);
+  } else {
+    showBootScreen("Verse O' Clock", "Connecting to Wi-Fi...");
+  }
+
+  // Attempt autoconnect (this is what triggers the "Connecting to SAVED AP" behavior in logs)
   bool ok = wm.autoConnect(SETUP_AP_SSID);
+
+  // After autoConnect returns, WiFi.SSID() often reflects the attempted/saved SSID even if connect failed.
+  String attemptedSsid = WiFi.SSID();
+  attemptedSsid.trim();
+
+  // Determine if there *was* a saved network to attempt this boot.
+  // Priority: attemptedSsid (most accurate now) -> lastSsid/wifiEver (fallback).
+  bool hasSavedThisBoot = attemptedSsid.length() > 0 || lastSsid.length() > 0 || wifiEver;
+
   if (ok) {
     Serial.print("[wifi] connected, IP=");
     Serial.println(WiFi.localIP());
+
+    gHadWifiSinceBoot = true;
+
+    // Record that we've successfully connected at least once.
+    setPrefsWifiEverAndSsid(WiFi.SSID());
+
+    gPortalReason1 = "";
+    gPortalReason2 = "";
   } else {
-    Serial.println("[wifi] no saved wifi, portal started");
+    // Portal is started by WiFiManager in this flow (non-blocking). We just set the *reason*.
+    if (hasSavedThisBoot) {
+      String ss = attemptedSsid.length() ? attemptedSsid : lastSsid;
+
+      if (ss.length()) {
+        Serial.printf("[wifi] saved wifi unavailable (%s), portal started\n", ss.c_str());
+        gPortalReason1 = "Setup portal: couldn't connect to saved Wi-Fi.";
+        gPortalReason2 = String("Saved network: ") + ss;
+      } else {
+        Serial.println("[wifi] saved wifi unavailable, portal started");
+        gPortalReason1 = "Setup portal: couldn't connect to saved Wi-Fi.";
+        gPortalReason2 = "Saved network unavailable.";
+      }
+    } else {
+      Serial.println("[wifi] no saved wifi, portal started");
+      gPortalReason1 = "Setup portal: no Wi-Fi saved yet.";
+      gPortalReason2 = "Choose your Wi-Fi and save settings.";
+    }
   }
 }
+
 
 void loop() {
   wm.process();
   persistWiFiManagerCustomParamsIfNeeded();
   server.handleClient();
 
+  // If the user asked for the power-off screen, keep it visible for a short time.
+  if (gShowPowerOffScreen) {
+    if (gPowerOffScreenUntilMs && (int32_t)(millis() - gPowerOffScreenUntilMs) >= 0) {
+      gShowPowerOffScreen = false;
+      gPowerOffScreenUntilMs = 0;
+      // Allow normal rendering to resume.
+    } else {
+      return; // don\'t draw home/setup over the power screen
+    }
+  }
+
   static bool serverStarted = false;
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (!setupScreenDrawn) {
-      showSetupScreen();
-      setupScreenDrawn = true;
+    // If we never connected this boot and Offline mode isn't enabled, force setup portal UI.
+    if (!getPrefsOffline() && !gHadWifiSinceBoot) {
+      if (!setupScreenDrawn) {
+        // Show a clear reason if we're in portal mode because saved WiFi failed.
+        showSetupScreen(gPortalReason1, gPortalReason2);
+        setupScreenDrawn = true;
+      }
+      return;
     }
-    return;
+    // Otherwise: we're already up and running; do NOT pop into setup.
+    // We'll keep the clock going and show a small Wi-Fi disconnected indicator.
+  } else {
+    gHadWifiSinceBoot = true;
+    setupScreenDrawn = false; // if we later intentionally enter portal, allow redraw
   }
 
   setupScreenDrawn = false;
@@ -2205,7 +2429,7 @@ void loop() {
 // Online only; in Offline mode we never attempt downloads.
 if (fsOk) {
   bool offlineNow = getPrefsOffline();
-  if (!offlineNow) {
+  if (!offlineNow && WiFi.isConnected()) {
     if (!contentOk) {
       unsigned long nowMs = millis();
       if (lastContentAttemptMs == 0 || (nowMs - lastContentAttemptMs) > 60UL * 1000UL) {
