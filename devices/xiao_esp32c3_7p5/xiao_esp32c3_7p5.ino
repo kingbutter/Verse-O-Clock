@@ -34,6 +34,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+static const char* BUILD_MARKER = "OTA_LOGS_V3_2025-12-20";
+
 // Storage / preferences
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -158,10 +160,22 @@ enum OtaState {
 };
 
 
+static volatile uint32_t gOtaCheckHits = 0;
+static volatile uint32_t gOtaApplyHits = 0;
 static volatile OtaState gOtaState = OTA_IDLE;
 static String gOtaMsg = "";
 static String gOtaErr = "";
 
+
+static void otaFail(const String& why) {
+  gOtaState = OTA_ERROR;
+  gOtaErr = why;
+  Serial.println(String("[ota] ERROR: ") + why);
+}
+
+static void otaLog(const String& s) {
+  Serial.println(String("[ota] ") + s);
+}
 
 // ---------------- OTA background task support (mobile-safe) ----------------
 static TaskHandle_t gOtaTaskHandle = nullptr;
@@ -1105,116 +1119,94 @@ static void handleRoot() {
           "}"
 
           "async function otaCheck(){"
-          "  const st=document.getElementById('otaStatus');"
-          "  const pill=document.getElementById('otaPill');"
+          "  var st=document.getElementById('otaStatus');"
+          "  var pill=document.getElementById('otaPill');"
+          "  var btn=document.getElementById('otaApplyBtn');"
           "  if(st) st.textContent='Checking...';"
           "  if(pill) pill.textContent='OTA: checking';"
           "  try{"
-          "    const r=await fetch('/ota_check',{cache:'no-store'});"
-          "    const j=await r.json();"
-          "    if(!j.ok){ if(st) st.textContent='Check failed: ' + (j.err||''); if(pill) pill.textContent='OTA: error'; return; }"
-          "    const btn=document.getElementById('otaApplyBtn');"
+          "    var r=await fetch('/ota_check',{cache:'no-store'});"
+          "    var j=await r.json();"
+          "    if(!j || !j.ok){"
+          "      if(st) st.textContent='Check failed: ' + ((j&&j.err)?j.err:'');"
+          "      if(pill) pill.textContent='OTA: error';"
+          "      if(btn) btn.disabled=true;"
+          "      return;"
+          "    }"
           "    if(j.update){"
           "      if(st) st.textContent='Update available: ' + j.latest + ' (current ' + j.current + ')';"
-          "      if(pill) pill.textContent='OTA: ' + j.latest;"
           "      if(pill) pill.textContent='OTA: ' + j.latest;"
           "      if(btn) btn.disabled=false;"
           "    } else {"
           "      if(st) st.textContent='Up to date (' + j.current + ')';"
           "      if(pill) pill.textContent='OTA: up to date';"
-          "      if(pill) pill.textContent='OTA: up to date';"
           "      if(btn) btn.disabled=true;"
           "    }"
-          "  }catch(e){ if(st) st.textContent='Check failed: ' + e; if(pill) pill.textContent='OTA: error'; }"
+          "  }catch(e){"
+          "    if(st) st.textContent='Check failed: ' + e;"
+          "    if(pill) pill.textContent='OTA: error';"
+          "    if(btn) btn.disabled=true;"
+          "  }"
           "}"
 
           "function otaApply(){"
-          "  const st=document.getElementById('otaStatus');"
-          "  const pill=document.getElementById('otaPill');"
-          "  const pre=document.getElementById('otaLog');"
-
+          "  var st=document.getElementById('otaStatus');"
+          "  var pill=document.getElementById('otaPill');"
+          "  var pre=document.getElementById('otaLog');"
           "  if(st) st.textContent='Starting update...';"
           "  if(pill) pill.textContent='OTA: starting';"
           "  if(pre){"
-          "    pre.textContent="
-          "      'Starting update...\\n'"
-          "    + 'You may lock your phone.\\n'"
-          "    + 'The device will reboot when finished.\\n';"
+          "    pre.textContent='Starting update...\\nYou may lock your phone.\\nThe device will reboot when finished.\\n';"
           "    pre.style.display='block';"
           "  }"
-
           "  try{"
-          "    if(navigator.sendBeacon){"
-          "      navigator.sendBeacon('/ota_apply','');"
-          "    } else {"
-          "      fetch('/ota_apply',{method:'POST',cache:'no-store'}).catch(function(){});"
-          "    }"
+          "    fetch('/ota_apply',{cache:'no-store'}).catch(function(){});"
           "  }catch(e){}"
-
           "  if(window.__otaTimer) clearInterval(window.__otaTimer);"
+          "  window.__otaSawRunning=false;"
           "  window.__otaTimer=setInterval(pollOtaStatus,1200);"
           "}"
 
-          "window.__otaSawRunning=false;"
-
           "function pollOtaStatus(){"
-          "  const st=document.getElementById('otaStatus');"
-          "  const pill=document.getElementById('otaPill');"
-          "  const pre=document.getElementById('otaLog');"
-
+          "  var st=document.getElementById('otaStatus');"
+          "  var pill=document.getElementById('otaPill');"
+          "  var pre=document.getElementById('otaLog');"
           "  fetch('/ota_status',{cache:'no-store'})"
           "    .then(function(r){return r.json();})"
           "    .then(function(j){"
-          "      if(!j||!j.state) return;"
-
-          "      if(pill) pill.textContent='OTA: '+j.state;"
-
+          "      if(!j || !j.state) return;"
+          "      if(pill) pill.textContent='OTA: ' + j.state;"
           "      if(j.state==='running'){"
           "        window.__otaSawRunning=true;"
           "        if(st) st.textContent='Updating...';"
           "        if(j.msg && pre) pre.textContent=j.msg;"
           "        return;"
           "      }"
-
-          "      if(j.state==='idle'){"
-          "        if(!window.__otaSawRunning){"
-          "          // OTA hasn't actually started (or /ota_apply never reached the device)."
-          "          if(st) st.textContent='Waiting for OTA to start...';"
-          "          if(pre){"
-          "            pre.textContent="
-          "              'Waiting for OTA to start...\\n'"
-          "            + 'If this never changes, /ota_apply may not be reachable (POST route).';"
-          "          }"
-          "          return;"
-          "        }"
-          "        // Only after we have seen 'running' do we treat 'idle' as completion."
-          "        if(st) st.textContent='Up to date ('+(j.fw||'')+')';"
-          "        if(pre) pre.textContent='Update complete.';"
-          "        clearInterval(window.__otaTimer);"
-          "        return;"
-          "      }"
-
           "      if(j.state==='error'){"
           "        if(st) st.textContent='Update failed';"
-          "        if(pre) pre.textContent='Error: '+(j.err||'unknown');"
-          "        clearInterval(window.__otaTimer);"
+          "        if(pre) pre.textContent='Error: ' + (j.err||'unknown');"
+          "        if(window.__otaTimer) clearInterval(window.__otaTimer);"
           "        return;"
           "      }"
-
-          "      // Any other state: keep showing status text"
+          "      if(j.state==='idle'){"
+          "        if(!window.__otaSawRunning){"
+          "          if(st) st.textContent='Waiting for OTA to start...';"
+          "          return;"
+          "        }"
+          "        if(st) st.textContent='Up to date (' + (j.fw||'') + ')';"
+          "        if(pre) pre.textContent='Update complete.';"
+          "        if(window.__otaTimer) clearInterval(window.__otaTimer);"
+          "        return;"
+          "      }"
           "      if(st) st.textContent='Updating...';"
           "      if(j.msg && pre) pre.textContent=j.msg;"
           "    })"
           "    .catch(function(){"
           "      if(pill) pill.textContent='OTA: reconnecting';"
           "      if(st) st.textContent='Reconnecting...';"
-          "      if(pre){"
-          "        pre.textContent="
-          "          'Reconnecting...\\n'"
-          "        + 'This is normal while the device reboots.';"
-          "      }"
           "    });"
           "}"
+
 
 
           "</script>"));
@@ -1878,6 +1870,11 @@ static void handleOtaCheck() {
   server.send(200, "application/json", "{\"ok\":false,\"err\":\"disabled\"}");
   return;
 #else
+
+
+  gOtaCheckHits++;
+  Serial.printf("[ota] handleOtaCheck hit #%lu at %lu ms (build=%s)\n", (unsigned long)gOtaCheckHits, (unsigned long)millis(), BUILD_MARKER);
+  Serial.println("[ota] /ota_check hit");
   String latest, url, err;
   int size = -1;
 
@@ -1899,7 +1896,9 @@ static void handleOtaCheck() {
   json += "}";
   server.send(200, "application/json", json);
 #endif
+  Serial.println("[ota] /ota_check done");
 }
+
 
 
 static void handleOtaApply() {
@@ -1907,11 +1906,17 @@ static void handleOtaApply() {
   server.send(400, "text/plain", "OTA is disabled in this build.");
   return;
 #else
+
+
+  gOtaApplyHits++;
+  Serial.printf("[ota] handleOtaApply hit #%lu at %lu ms (build=%s)\n", (unsigned long)gOtaApplyHits, (unsigned long)millis(), BUILD_MARKER);
+  Serial.println("[ota] /ota_apply hit");
   if (WiFi.status() != WL_CONNECTED) {
     server.send(400, "text/plain", "WiFi not connected. Connect to your WiFi first, then retry.");
     return;
   }
   if (gOtaTaskHandle != nullptr) {
+    Serial.println("[ota] already running");
     server.send(409, "application/json", "{\"ok\":false,\"msg\":\"OTA already running\"}");
     return;
   }
@@ -1923,7 +1928,8 @@ static void handleOtaApply() {
   // Respond immediately so mobile browsers can sleep/lock without killing the OTA stream.
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"OTA started\"}");
 
-  xTaskCreatePinnedToCore(
+    Serial.println("[ota] task created");
+xTaskCreatePinnedToCore(
     otaTask,
     "otaTask",
     8192,
@@ -1937,6 +1943,8 @@ static void handleOtaApply() {
 
 
 static void runOtaApplyCore() {
+  otaLog("core start");
+
 Serial.println("[ota] handleOtaApply hit");
 gOtaState = OTA_RUNNING;
 gOtaMsg = "Downloading and applying update...";
@@ -1955,8 +1963,8 @@ String latestTag, assetUrl, err;
 
   bool ok = otaGetLatestInfo(latestTag, assetUrl, assetSize, err);
   if (!ok) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("Error: ") + err);
     sendChunk(String("[ota] ERROR: ") + err + "\n");
 return;
   }
@@ -1968,6 +1976,7 @@ return;
   }
 
   sendChunk(String("[ota] downloading: ") + assetUrl + "\n");
+  otaLog(String("assetUrl=") + assetUrl);
   if (assetSize > 0) {
     sendChunk(String("[ota] declared size: ") + String(assetSize) + " bytes\n");
   }
@@ -1979,15 +1988,17 @@ WiFiClientSecure client;
   http.setTimeout(20000);
 
   if (!http.begin(client, assetUrl)) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("Error: http.begin failed"));
     sendChunk(F("[ota] ERROR: http.begin failed\n"));
 return;
   }
 
   int code = http.GET();
-
-  // Log basics (Serial + web)
+  otaLog(String("httpCode=") + code);
+  otaLog(String("contentLength=") + http.getSize());
+  { String ct = http.header("Content-Type"); if (ct.length()) otaLog(String("contentType=") + ct); }
+// Log basics (Serial + web)
   {
     String ct = http.header("Content-Type");
     int len0 = http.getSize();
@@ -2002,8 +2013,9 @@ return;
 }
 
   if (code != 200) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    otaFail(String("HTTP ") + String(code) + " " + http.errorToString(code));
+    /* keep */
+otaFail(String("[ota] ERROR: http ") + String(code) + "\n");
     sendChunk(String("[ota] ERROR: http ") + String(code) + "\n");
     String body = http.getString();
     if (body.length()) {
@@ -2015,8 +2027,8 @@ return;
 
   int len = http.getSize();
   if (len <= 0) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.\n"));
     sendChunk(F("[ota] ERROR: No Content-Length (chunked/redirect?). Refusing OTA.\n"));
     sendChunk(F("[ota] Hint: ensure the URL is a direct .bin asset download, not HTML.\n"));
     http.end();
@@ -2025,19 +2037,22 @@ return;
 
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("[ota] ERROR: no HTTP stream\n"));
     sendChunk(F("[ota] ERROR: no HTTP stream\n"));
     http.end();
 return;
   }
 
-  int first = stream->peek(); // does not consume the byte
+  int first = stream->peek();
+  otaLog(String("firstByte=0x") + String((first < 0) ? 0 : first, HEX));
+// does not consume the byte
   sendChunk(String("[ota] First byte (peek): 0x") + String((first < 0) ? 0 : first, HEX) + "\n");
 // ESP32 app images typically start with 0xE9
   if (first != 0xE9) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    otaFail(String("bad header byte 0x") + String(first, HEX) + " (not firmware)");
+    /* keep */
+otaFail(String("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).\n"));
     sendChunk(F("[ota] ERROR: Download does not look like ESP32 firmware (expected 0xE9).\n"));
     sendChunk(F("[ota] Usually this means you downloaded HTML or the wrong asset (e.g., littlefs.bin).\n"));
     http.end();
@@ -2046,8 +2061,8 @@ return;
 
   // Force firmware update target explicitly (prevents confusion with filesystem updates)
   if (!Update.begin((size_t)len, U_FLASH)) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
     sendChunk(String("[ota] ERROR: Update.begin failed: ") + Update.errorString() + "\n");
     Update.printError(Serial);
     http.end();
@@ -2062,13 +2077,14 @@ if (md5.length()) {
 
 
   size_t written = Update.writeStream(*stream);
-  sendChunk(String("[ota] Written: ") + String(written) + " bytes\n");
+  otaLog(String("written=") + String(written));
+sendChunk(String("[ota] Written: ") + String(written) + " bytes\n");
   if ((int)written != len) {
     sendChunk(String("[ota] WARN: wrote ") + String(written) + " of " + String(len) + "\n");
   }
 if (!Update.end()) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
     sendChunk(String("[ota] ERROR: Update.end failed: ") + Update.errorString() + "\n");
     Update.printError(Serial);
     http.end();
@@ -2078,13 +2094,13 @@ return;
   http.end();
 
   if (!Update.isFinished()) {
-    gOtaState = OTA_ERROR;
-    gOtaErr = "OTA failed";
+    /* keep */
+otaFail(String("[ota] ERROR: update not finished\n"));
     sendChunk(F("[ota] ERROR: update not finished\n"));
 return;
   }
 
-  otaSetMsg("Success. Rebooting..."); gOtaState = OTA_DONE;
+  otaLog("Success. Rebooting..."); gOtaState = OTA_DONE;
 delay(250);
   ESP.restart();
 #endif
@@ -2338,7 +2354,9 @@ static void handleOtaStatus() {
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  
+  Serial.printf("[ota] build=%s\n", BUILD_MARKER);
+delay(100);
 
   Serial.println();
   Serial.println("==========================================");
