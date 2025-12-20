@@ -158,15 +158,20 @@ enum OtaState {
 };
 
 
+static volatile OtaState gOtaState = OTA_IDLE;
+static String gOtaMsg = "";
+static String gOtaErr = "";
+
+
 // ---------------- OTA background task support (mobile-safe) ----------------
 static TaskHandle_t gOtaTaskHandle = nullptr;
+
+static void runOtaApplyCore(); // forward
 
 static void otaSetMsg(const String& s) {
   gOtaMsg = s;
   Serial.println(String("[ota] ") + s);
 }
-
-static void runOtaApplyCore(); // forward
 
 static void otaTask(void* pv) {
   (void)pv;
@@ -175,11 +180,6 @@ static void otaTask(void* pv) {
   vTaskDelete(nullptr);
 }
 // --------------------------------------------------------------------------
-static volatile OtaState gOtaState = OTA_IDLE;
-static String gOtaMsg = "";
-static String gOtaErr = "";
-
-
 // -----------------------
 // WiFiManager custom params (so first-run setup can configure everything
 // without needing to connect again after WiFi is saved)
@@ -2084,7 +2084,7 @@ return;
 return;
   }
 
-  otaSetMsg("Success. Rebooting..."); gOtaState = OTA_SUCCESS;
+  otaSetMsg("Success. Rebooting..."); gOtaState = OTA_DONE;
 delay(250);
   ESP.restart();
 #endif
