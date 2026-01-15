@@ -219,6 +219,7 @@ jobs:
           fi
 
           arduino-cli compile \
+            --libraries "./common" \
             --fqbn "${{ matrix.device.fqbn }}" \
             --export-binaries \
             --build-path "${{ matrix.device.sketch }}/build" \
@@ -244,7 +245,7 @@ jobs:
           PART_CSV="$SKETCH_DIR/partitions.csv"
 
           if [[ ! -f "$PART_CSV" ]]; then
-            PROPS="$(arduino-cli compile --fqbn "$FQBN" --show-properties --build-path "$SKETCH_DIR/build" "$SKETCH_DIR")"
+            PROPS="$(arduino-cli compile --libraries "./common" --fqbn "$FQBN" --show-properties --build-path "$SKETCH_DIR/build" "$SKETCH_DIR")"
             RUNTIME_PLATFORM_PATH="$(printf "%s\n" "$PROPS" | awk -F= '$1=="runtime.platform.path"{print $2; exit}')"
             BUILD_PARTITIONS="$(printf "%s\n" "$PROPS" | awk -F= '$1=="build.partitions"{print $2; exit}')"
 
