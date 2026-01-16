@@ -218,8 +218,7 @@ jobs:
             EXTRA_CPP_FLAGS=""
           fi
 
-          arduino-cli compile \
-            --fqbn "${{ matrix.device.fqbn }}" \
+          arduino-cli compile \            --fqbn "${{ matrix.device.fqbn }}" \
             --export-binaries \
             --build-path "${{ matrix.device.sketch }}/build" \
             --build-property "compiler.cpp.extra_flags=${EXTRA_CPP_FLAGS}" \
