@@ -57,6 +57,12 @@ static const char* BUILD_MARKER = "OTA_LOGS_V3_2025-12-20";
 
 // QR code + compression
 #include "qrcodegen.h"
+
+// Compile qrcodegen implementation as part of this sketch TU
+extern "C" {
+#include "qrcodegen.c"
+}
+
 #include "unishox2.h"
 
 // -----------------------------------------------------------------------------
@@ -80,7 +86,6 @@ static const char* BUILD_MARKER = "OTA_LOGS_V3_2025-12-20";
 #define OTA_GH_REPO  "Verse-O-Clock"
 #define OTA_FW_ASSET_SUFFIX "_firmware.bin"
 
-
 // -----------------------------------------------------------------------------
 // Verse content repository (raw GitHub)
 // -----------------------------------------------------------------------------
@@ -95,17 +100,16 @@ static const char* BUILD_MARKER = "OTA_LOGS_V3_2025-12-20";
 #define CONTENT_TEXTS_URL   String(CONTENT_BASE_URL) + "/texts.bin"
 #define CONTENT_MANIFEST_URL String(CONTENT_BASE_URL) + "/manifest.json"
 
-
 #if ENABLE_HTTP_OTA
   #include "verseoclock_version.h"
 
-#include "VerseOClockCore.h"
-
 // Map legacy 'display' identifier used throughout the sketch to the device-provided display.
-#define display (vocDisplay())
+#ifndef VOC_DISPLAY
+#error "Device must define VOC_DISPLAY (e.g. #define VOC_DISPLAY g_display) before including voc_shared.ino"
+#endif
+#define display (VOC_DISPLAY)
 
 #endif
-
 
 // PINS (adjust if needed)
 // -----------------------
@@ -150,13 +154,11 @@ enum OtaState {
   OTA_ERROR
 };
 
-
 static volatile uint32_t gOtaCheckHits = 0;
 static volatile uint32_t gOtaApplyHits = 0;
 static volatile OtaState gOtaState = OTA_IDLE;
 static String gOtaMsg = "";
 static String gOtaErr = "";
-
 
 static void otaFail(const String& why) {
   gOtaState = OTA_ERROR;
@@ -238,7 +240,6 @@ bool setupScreenDrawn = false;
 
 static File fToc, fEntries, fTexts;
 static TocEntry toc[SLOT_COUNT];
-
 
 // -----------------------
 // Forward declarations
@@ -448,7 +449,6 @@ static bool getPrefsGlance() {
   return v;
 }
 
-
 static bool getPrefsSetupDone() {
   prefs.begin("voc", true);
   bool v = prefs.getBool("setupDone", false);
@@ -456,15 +456,12 @@ static bool getPrefsSetupDone() {
   return v;
 }
 
-
-
 static bool getPrefsOffline() {
   prefs.begin("voc", true);
   bool v = prefs.getBool("offline", false); // default: online
   prefs.end();
   return v;
 }
-
 
 static bool getPrefsPwrMsg() {
   // Default behavior:
@@ -490,7 +487,6 @@ static uint32_t getPrefsManualSetMs() {
   prefs.end(); 
   return v; 
 }
-
 
 // Format time based on preference. For 12-hour, returns AM/PM separately.
 static String formatTime(const tm& t, bool& hasAmPm, String& ampmOut) {
@@ -1017,7 +1013,6 @@ static void sendChunk(const String& s) {
   delay(0);
 }
 
-
 static void handleRoot() {
   // Serve the on-device configuration UI (WiFi + clock options).
   // Uses chunked transfer to keep RAM usage low.
@@ -1198,10 +1193,7 @@ static void handleRoot() {
           "    });"
           "}"
 
-
-
           "</script>"));
-
 
   sendY(F("</head><body>"));
 
@@ -1313,7 +1305,6 @@ static void handleRoot() {
 
   sendY(F("</div><div class='hint'>Glance mode shows a bigger clock + shorter verse snippet for across-the-room readability.</div>"));
 
-
   // Power / battery reminder (optional)
   sendY(F("<label style='display:flex;align-items:center;gap:10px;margin:10px 0 0 0;padding:10px;"
           "border-radius:12px;border:1px solid var(--border);background:var(--card);'>"));
@@ -1321,7 +1312,6 @@ static void handleRoot() {
                  F("<input type='checkbox' id='pwrmsg' name='pwrmsg' value='1'>"));
   sendY(F(" After Save, show a safe-to-unplug message on the ePaper</label>"));
   sendY(F("<div class='hint'>Useful during first-time setup: after saving, the screen will say it is safe to unplug USB, and remind you to plug in the battery or switch it to <b>ON</b>.</div>"));
-
 
   // Offline mode + manual time
   sendY(F("<h2>Offline mode</h2>"));
@@ -1364,13 +1354,11 @@ static void handleRoot() {
           "});"
           "</script>"));
 
-
   sendY(F("</body></html>"));
 
   server.sendContent(""); // finalize chunked transfer
   // DO NOT forcibly stop the client here; let the server finish cleanly.
 }
-
 
 static void handleSave() {
   if (!server.hasArg("tz")) { server.send(400, "text/plain", "Missing tz"); return; }
@@ -1464,7 +1452,6 @@ static void handleSave() {
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Saved");
 }
-
 
 // -----------------------
 // Rendering
@@ -1704,12 +1691,10 @@ if (!glance && WiFi.status() == WL_CONNECTED) {
   display.print(url);
 }
 
-
   } while (display.nextPage());
 
   if (!didFirstFullRefresh) didFirstFullRefresh = true;
 }
-
 
 static void handleIpGeo() {
   // Proxy endpoint to fetch approximate lat/lon from ipapi.co server-side.
@@ -1779,7 +1764,6 @@ struct OtaInfo {
   int assetSize = -1;
   String err;
 };
-
 
 static bool otaGetLatestInfo(String &latestTag, String &assetUrl, int &assetSize, String &err) {
   latestTag = "";
@@ -1862,7 +1846,6 @@ static void handleOtaCheck() {
   return;
 #else
 
-
   gOtaCheckHits++;
   Serial.printf("[ota] handleOtaCheck hit #%lu at %lu ms (build=%s)\n", (unsigned long)gOtaCheckHits, (unsigned long)millis(), BUILD_MARKER);
   Serial.println("[ota] /ota_check hit");
@@ -1890,14 +1873,11 @@ static void handleOtaCheck() {
   Serial.println("[ota] /ota_check done");
 }
 
-
-
 static void handleOtaApply() {
 #if !ENABLE_HTTP_OTA
   server.send(400, "text/plain", "OTA is disabled in this build.");
   return;
 #else
-
 
   gOtaApplyHits++;
   Serial.printf("[ota] handleOtaApply hit #%lu at %lu ms (build=%s)\n", (unsigned long)gOtaApplyHits, (unsigned long)millis(), BUILD_MARKER);
@@ -1931,7 +1911,6 @@ xTaskCreatePinnedToCore(
   );
 #endif
 }
-
 
 static void runOtaApplyCore() {
   otaLog("core start");
@@ -2066,7 +2045,6 @@ if (md5.length()) {
   Update.setMD5(md5.c_str());
 }
 
-
   size_t written = Update.writeStream(*stream);
   otaLog(String("written=") + String(written));
 sendChunk(String("[ota] Written: ") + String(written) + " bytes\n");
@@ -2097,7 +2075,6 @@ delay(250);
 #endif
 }
 
-
 // Back-compat: keep /ota endpoint as "apply update"
 static void handleOta() {
   gOtaState = OTA_DONE;
@@ -2105,10 +2082,6 @@ static void handleOta() {
   delay(300);
   handleOtaApply();
 }
-
-
-
-
 
 // -----------------------
 // setup / loop
@@ -2189,7 +2162,6 @@ static void initWiFiManagerCustomParams() {
 
   wm.setSaveConfigCallback(wmSaveCallback);
 }
-
 
 static void persistWiFiManagerCustomParamsIfNeeded() {
   if (!wmShouldSaveParams) return;
@@ -2291,7 +2263,6 @@ static void persistWiFiManagerCustomParamsIfNeeded() {
   Serial.println("[wifi] saved custom params from WiFiManager portal");
 }
 
-
 static void startWiFiManagerPortal(bool wipeWifi) {
   if (wipeWifi) {
     Serial.println("[wifi] wiping WiFi credentials and starting portal");
@@ -2340,8 +2311,6 @@ static void handleOtaStatus() {
 
   server.send(200, "application/json", json);
 }
-
-
 
 void voc::setup() {
   Serial.begin(115200);

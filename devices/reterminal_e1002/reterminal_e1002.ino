@@ -1,38 +1,48 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <GxEPD2_BW.h>
-#include <GxEPD2_3C.h>
-#include <VerseOClockCore.h>
+#include <GxEPD2_7C.h>
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSans18pt7b.h>
+#include <Fonts/FreeSans24pt7b.h>
+
 #include "verseoclock_version.h"
+#include "../../common/voc_shared.h"
 
-// NOTE: Pin mapping for reTerminal E Series is different from XIAO.
-// These defaults are based on Seeed's documentation for shared SPI pins.
-// Please verify CS/DC/RST/BUSY pins against the Seeed wiki / schematic for your unit.
+// Pin map per Seeed reTerminal E10xx Arduino guide
+static const int EPD_SCK_PIN  = 7;
+static const int EPD_MOSI_PIN = 9;
+static const int EPD_CS_PIN   = 10;
+static const int EPD_DC_PIN   = 11;
+static const int EPD_RES_PIN  = 12;
+static const int EPD_BUSY_PIN = 13;
 
-// Shared SPI (also used by SD card on reTerminal E Series):
-static const int PIN_SPI_SCK  = 7;  // SD_SCK_PIN
-static const int PIN_SPI_MISO = 8;  // SD_MISO_PIN
-static const int PIN_SPI_MOSI = 9;  // SD_MOSI_PIN
+// Shared bus with SD (not required to mount SD, but SD can contend)
+static const int SD_CS_PIN = 14;
+static const int SD_MISO_PIN = 8;
+static const int SD_EN_PIN = 16;
 
-// TODO: verify these ePaper control pins (placeholders that compile)
-static const int PIN_EPD_CS   = 10;
-static const int PIN_EPD_DC   = 11;
-static const int PIN_EPD_RST  = 12;
-static const int PIN_EPD_BUSY = 13;
+SPIClass hspi(HSPI);
 
-// TODO: For E1002 (Spectra 6 full-color), swap this to the correct GxEPD2 7.3" color panel driver.
-// For now we compile using the same 7.5" BW driver as a placeholder.
-GxEPD2_BW<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT> g_display(
-  GxEPD2_750_GDEY075T7(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY)
+GxEPD2_7C<GxEPD2_730c_GDEP073E01, GxEPD2_730c_GDEP073E01::HEIGHT> g_display(
+  GxEPD2_730c_GDEP073E01(EPD_CS_PIN, EPD_DC_PIN, EPD_RES_PIN, EPD_BUSY_PIN)
 );
 
-GxEPD2_GFX& vocDisplay() { return g_display; }
-
 void vocDeviceBegin() {
-  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
-  g_display.init(0);
-  g_display.setRotation(1);
+  pinMode(SD_EN_PIN, OUTPUT);
+  digitalWrite(SD_EN_PIN, HIGH);
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  hspi.begin(EPD_SCK_PIN, SD_MISO_PIN, EPD_MOSI_PIN, -1);
+  g_display.epd2.selectSPI(hspi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  g_display.init(115200);
+  g_display.setRotation(0);
 }
+
+#define VOC_DISPLAY g_display
+#include "../../common/voc_shared.ino"
+#undef VOC_DISPLAY
 
 void setup() { voc::setup(); }
 void loop()  { voc::loop(); }

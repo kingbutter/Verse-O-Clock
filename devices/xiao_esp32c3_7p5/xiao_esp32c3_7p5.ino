@@ -1,12 +1,13 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 #include <Fonts/FreeSans24pt7b.h>
 
-#include <VerseOClockCore.h>
 #include "verseoclock_version.h"
+#include "../../common/voc_shared.h"
 
 // -----------------------
 // Pins (device-specific)
@@ -27,16 +28,18 @@ GxEPD2_BW<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT> g_display(
   GxEPD2_750_GDEY075T7(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY)
 );
 
-GxEPD2_GFX& vocDisplay() {
-  return g_display;
-}
-
+// Device hook called by shared core.
 void vocDeviceBegin() {
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
   g_display.init(0);
   // Core expects landscape orientation
-  g_display.setRotation(1);
+  g_display.setRotation(0);
 }
+
+// Provide the shared code a name for the concrete display object.
+#define VOC_DISPLAY g_display
+#include "../../common/voc_shared.ino"
+#undef VOC_DISPLAY
 
 void setup() {
   voc::setup();
